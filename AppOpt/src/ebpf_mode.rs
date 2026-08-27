@@ -104,25 +104,22 @@ fn attach_tracepoint(bpf: &mut Ebpf, category: &str, name: &str, required: bool)
     true
 }
 
-/// 构建白名单键，每个包名生成前 8 字节与末 8 字节键
-fn comm_keys_build<'a, I: IntoIterator<Item = &'a String>>(pkgs: I) -> Vec<[u8; 8]> {
-    let mut entries: Vec<[u8; 8]> = Vec::new();
+/// 构建白名单键，每个包名生成前 15 字节与末 15 字节键
+fn comm_keys_build<'a, I: IntoIterator<Item = &'a String>>(pkgs: I) -> Vec<[u8; 15]> {
+    let mut entries: Vec<[u8; 15]> = Vec::new();
     for pkg in pkgs {
         let bytes = pkg.as_bytes();
         if bytes.is_empty() {
             continue;
         }
-
-        let mut prefix_key = [0u8; 8];
-        let prefix_len = bytes.len().min(8);
-        prefix_key[..prefix_len].copy_from_slice(&bytes[..prefix_len]);
-        entries.push(prefix_key);
-
-        if bytes.len() > 8 {
-            let mut suffix_key = [0u8; 8];
-            let start = bytes.len() - 8;
-            suffix_key.copy_from_slice(&bytes[start..]);
-            entries.push(suffix_key);
+        let mut prefix = [0u8; 15];
+        let end = bytes.len().min(15);
+        prefix[..end].copy_from_slice(&bytes[..end]);
+        entries.push(prefix);
+        if bytes.len() > 15 {
+            let mut suffix = [0u8; 15];
+            suffix.copy_from_slice(&bytes[bytes.len() - 15..]);
+            entries.push(suffix);
         }
     }
     entries.sort();
@@ -147,7 +144,7 @@ pub fn comm_map_init(bpf: &mut Ebpf, pkgs: &HashSet<String>, comm_capacity: u32)
         eprintln!("eBPF: 未找到 TARGET_COMM_MAP");
         return false;
     };
-    let mut target_map = match AyaHashMap::<_, [u8; 8], u32>::try_from(map) {
+    let mut target_map = match AyaHashMap::<_, [u8; 15], u32>::try_from(map) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("eBPF: TARGET_COMM_MAP 类型转换失败 ({})", e);
@@ -155,7 +152,7 @@ pub fn comm_map_init(bpf: &mut Ebpf, pkgs: &HashSet<String>, comm_capacity: u32)
         }
     };
 
-    let old_keys: Vec<[u8; 8]> = target_map.keys().filter_map(|r| r.ok()).collect();
+    let old_keys: Vec<[u8; 15]> = target_map.keys().filter_map(|r| r.ok()).collect();
     for key in &old_keys {
         let _ = target_map.remove(key);
     }
