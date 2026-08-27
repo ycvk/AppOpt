@@ -16,7 +16,6 @@ const EVENT_RENAME: u32 = 3;
 const EVENT_EXIT: u32 = 4;
 
 /// 4 类 tracepoint 字段布局：fork 读 child_pid/child_comm，exec/exit 用 bpf_get_current_pid_tgid，rename 读 newcomm
-
 /// 用户态解析 format 文件注入的字段偏移，因内核版本设备而异禁止硬编码
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -38,9 +37,9 @@ struct ProcEvent {
 const MAP_CAPACITY: u32 = 16 << 5;
 const APPLIED_CAPACITY: u32 = 8192;
 
-/// 白名单键为包名前 8 字节或末 8 字节
+/// 白名单键为包名前 15 字节或末 15 字节，与 comm 截断上限一致
 #[map]
-static TARGET_COMM_MAP: HashMap<[u8; 8], u32> = HashMap::with_max_entries(MAP_CAPACITY, 0);
+static TARGET_COMM_MAP: HashMap<[u8; 15], u32> = HashMap::with_max_entries(MAP_CAPACITY, 0);
 
 /// 已应用亲和性表 tid 到 CPU mask，LruHashMap 配合 ESRCH 兜底
 #[map]
@@ -76,15 +75,15 @@ struct EventMeta {
 
 #[inline(always)]
 fn applied_lookup(key: u32) -> bool {
-    unsafe { APPLIED_MAP.get(&key) }.is_some()
+    unsafe { APPLIED_MAP.get(key) }.is_some()
 }
 
-/// 在 comm 16 字节上以 8 字节窗口滑动匹配白名单
+/// 在 comm 16 字节上以 15 字节窗口滑动匹配白名单
 #[inline(always)]
 fn whitelist_matched(comm: &[u8; 16]) -> bool {
-    for pos in 0..=8usize {
-        let key: [u8; 8] = comm[pos..pos + 8].try_into().unwrap_or([0u8; 8]);
-        if unsafe { TARGET_COMM_MAP.get(&key) }.is_some() {
+    for pos in 0..=1usize {
+        let key: [u8; 15] = comm[pos..pos + 15].try_into().unwrap_or([0u8; 15]);
+        if unsafe { TARGET_COMM_MAP.get(key) }.is_some() {
             return true;
         }
     }
@@ -153,7 +152,7 @@ fn report_named_event(ctx: &TracePointContext, event_type: u32) -> u32 {
     }
 
     if event_type == EVENT_FORK && is_tracked {
-        let _ = APPLIED_MAP.insert(&(meta.tid as u32), &0, 0);
+        let _ = APPLIED_MAP.insert(meta.tid as u32, 0, 0);
     }
 
     submit_event(ProcEvent {
@@ -217,7 +216,7 @@ fn sched_process_exit(_ctx: TracePointContext) -> u32 {
         return 0;
     }
 
-    let _ = APPLIED_MAP.remove(&tid);
+    let _ = APPLIED_MAP.remove(tid);
 
     submit_event(ProcEvent {
         pid: tgid as i32,
