@@ -1,6 +1,7 @@
 use std::ffi::CString;
 
 use crate::MAX_THREAD_LEN;
+use crate::apply_affinity::read_cmdline;
 use crate::config::AppConfig;
 use crate::cpuset::{ensure_cpuset_dir, CpuSet};
 
@@ -82,21 +83,18 @@ fn fnmatch_c(pattern: &CString, string: &str) -> bool {
 }
 
 /// 通过内核 comm 匹配配置包名
-pub fn comm_to_pkg(comm: &str, cfg: &AppConfig) -> Option<String> {
+pub fn comm_to_pkg(pid: i32, comm: &str, cfg: &AppConfig) -> Option<String> {
     if cfg.pkgs.contains(comm) {
         return Some(comm.to_string());
     }
-    if comm.len() >= 15 {
-        for pkg in &cfg.pkgs {
-            if pkg.starts_with(comm) {
-                return Some(pkg.clone());
-            }
-        }
-        for pkg in &cfg.pkgs {
-            if pkg.ends_with(comm) {
-                return Some(pkg.clone());
-            }
-        }
+    // comm 大于等于15字节则读取 cmdline
+    if comm.len() >= 15
+        && cfg
+            .pkgs
+            .iter()
+            .any(|p| p.starts_with(comm) || p.ends_with(comm))
+    {
+        return read_cmdline(pid).filter(|name| cfg.pkgs.contains(name));
     }
     None
 }
