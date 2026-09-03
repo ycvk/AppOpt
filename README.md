@@ -23,11 +23,6 @@ http://appopt.suto.top
 | `appopt-ebpf` | eBPF 内核态 |
 
 
-### 请作者喝咖啡
-
-![请作者喝奶茶](%E8%AF%B7%E4%BD%9C%E8%80%85%E6%9D%AF%E5%A5%B6%E8%8C%B6.png)
-
-
 ### 命令行参数
 
 | 参数 | 说明 | 默认值 |
@@ -37,3 +32,9 @@ http://appopt.suto.top
 | `-b <name>` | 指定 BASE_CPUSET 目录名（不可含 `/`） | `AppOpt` |
 | `-v` | 显示版本信息 | — |
 | `-h` | 显示帮助 | — |
+
+
+### 请作者喝咖啡
+
+![请作者喝奶茶](%E8%AF%B7%E4%BD%9C%E8%80%85%E6%9D%AF%E5%A5%B6%E8%8C%B6.png)
+
