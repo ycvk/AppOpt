@@ -680,7 +680,7 @@ async function saveField(body){
   try{await api('/api/config',body);toast('已保存');loadCfg()}
   catch(e){toast(e.message)}
 }
-$('c-interval-save').onclick=()=>saveField({interval:Math.max(1,+$('c-interval').value||0)});
+$('c-interval-save').onclick=()=>saveField({interval:+$('c-interval').value});
 $('c-cpuset-save').onclick=()=>saveField({cpuset_name:$('c-cpuset').value.trim()});
 $('c-file-save').onclick=()=>saveField({config_file:$('c-file').value.trim()});
 
