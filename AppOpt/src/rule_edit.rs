@@ -2,9 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::grammar::{
-    Node, OuterLine, comment_at, parse_outer, scan, split_single_line, strip_comment,
-};
+use crate::grammar::{Node, OuterLine, comment_at, parse_outer, scan};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum EditError {
@@ -162,10 +160,8 @@ fn normalize_singles(lines: &mut Vec<String>, pkg: &str) {
     let mut items: Vec<(ThreadLoc, String)> = Vec::new();
     for loc in t.singles() {
         let raw_line = lines[loc.idx].trim();
-        let raw = strip_comment(raw_line);
-        let body = raw.strip_suffix('{').map(str::trim_end).unwrap_or(raw);
-        if let Some((_, th, cp)) = split_single_line(body) {
-            let line = with_comment(&format!("\t{th}={cp}"), raw_line);
+        if let OuterLine::Single { thread, cpus, .. } = parse_outer(raw_line) {
+            let line = with_comment(&format!("\t{thread}={cpus}"), raw_line);
             items.push((*loc, line));
         }
     }
