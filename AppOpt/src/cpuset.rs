@@ -338,13 +338,6 @@ impl CpusetFs {
         Ok(Some(this))
     }
 
-    pub fn name(&self) -> &str {
-        self.root
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default()
-    }
-
     /// cpus 对应目录的 tasks 文件，子目录按需创建
     pub fn tasks_path(&self, cpus: &CpuSet) -> PathBuf {
         if *cpus == self.present {
@@ -538,7 +531,6 @@ mod tests {
 
         let present = set("0-7");
         let cs = CpusetFs::open(&base, "AppOpt", &present).unwrap().unwrap();
-        assert_eq!(cs.name(), "AppOpt");
         assert_eq!(fs::read_to_string(base.join("AppOpt/cpus")).unwrap(), "0-7");
         assert_eq!(fs::read_to_string(base.join("AppOpt/mems")).unwrap(), "0");
 
