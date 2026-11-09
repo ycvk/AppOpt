@@ -160,10 +160,6 @@ impl Shared {
         self.config_gen.load(Ordering::Acquire)
     }
 
-    pub fn topo(&self) -> &CpuTopology {
-        &self.topo
-    }
-
     pub fn stats(&self) -> Stats {
         *self.stats.lock().expect("统计锁中毒")
     }
@@ -397,7 +393,7 @@ mod tests {
         let broken = Shared::new(
             before.clone(),
             dir.join("missing/AppOpt.json"),
-            s.topo().clone(),
+            s.config().topo.clone(),
             None,
         )
         .unwrap();
