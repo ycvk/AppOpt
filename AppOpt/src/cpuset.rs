@@ -35,10 +35,6 @@ impl CpuSet {
         self.bits[cpu / WORD_BITS] |= 1 << (cpu % WORD_BITS);
     }
 
-    pub fn contains(&self, cpu: usize) -> bool {
-        cpu < CPU_SETSIZE && self.bits[cpu / WORD_BITS] & (1 << (cpu % WORD_BITS)) != 0
-    }
-
     pub fn len(&self) -> usize {
         self.bits.iter().map(|w| w.count_ones() as usize).sum()
     }
