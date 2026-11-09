@@ -95,7 +95,7 @@ impl ProcCache {
         }
     }
 
-    /// 计算并立即绑定
+    /// 计算并立即绑定；sticky 为假时结果不当作线程规则保留（名字继承自父线程，改名后要按新名字重算）
     pub fn apply(
         &mut self,
         cfg: &AppConfig,
@@ -103,12 +103,14 @@ impl ProcCache {
         tid: i32,
         pid: i32,
         comm: &str,
+        sticky: bool,
     ) -> Outcome {
-        let r = match self.plan(cfg, group, tid, comm) {
+        let mut r = match self.plan(cfg, group, tid, comm) {
             Plan::NoRule => return Outcome::NoRule,
             Plan::Keep => return Outcome::Kept,
             Plan::Bind(r) => r,
         };
+        r.thread_rule &= sticky;
         match bind_thread(tid, &r.cpus, cfg.cpusets.as_deref()) {
             Bind::Gone => {
                 self.tasks.remove(&tid);
@@ -151,5 +153,65 @@ impl ProcCache {
             self.tasks.remove(tid);
         }
         gone
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cpuset::CpuTopology;
+    use std::sync::mpsc;
+    use std::thread;
+
+    /// 起一个空闲线程作为绑定对象，返回其 tid；线程在 done 被丢弃后退出
+    fn idle_thread() -> (i32, mpsc::Sender<()>) {
+        let (tid_tx, tid_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        thread::spawn(move || {
+            // SAFETY: gettid 无参数，只返回调用线程的 id
+            tid_tx.send(unsafe { libc::gettid() }).unwrap();
+            let _ = done_rx.recv();
+        });
+        (tid_rx.recv().unwrap(), done_tx)
+    }
+
+    #[test]
+    fn inherited_name_does_not_pin_thread_rule() {
+        let present = CpuSet::parse_list("0-1").unwrap();
+        // 包级规则 0，名为 a 的线程（即主线程名）走线程规则 1
+        let cfg = AppConfig::parse(
+            "a=0 {\n\ta=1\n}\n",
+            CpuTopology::from_groups(present, []),
+            None,
+        );
+        let group = cfg.group("a").unwrap();
+        let pid = std::process::id() as i32;
+        let cpus = |s| CpuSet::parse_list(s).unwrap();
+
+        // 新线程沿用父线程名 a：先按线程规则绑定，改名后按新名字落到包级规则
+        let (tid, _done) = idle_thread();
+        let mut cache = ProcCache::default();
+        assert_eq!(
+            cache.apply(&cfg, group, tid, pid, "a", false),
+            Outcome::Bound
+        );
+        assert_eq!(CpuSet::of_thread(tid).unwrap(), cpus("1"));
+        assert_eq!(
+            cache.apply(&cfg, group, tid, pid, "Worker", true),
+            Outcome::Bound
+        );
+        assert_eq!(CpuSet::of_thread(tid).unwrap(), cpus("0"));
+
+        // 真实名字命中的线程规则仍然保留
+        let (tid, _done) = idle_thread();
+        assert_eq!(
+            cache.apply(&cfg, group, tid, pid, "a", true),
+            Outcome::Bound
+        );
+        assert_eq!(
+            cache.apply(&cfg, group, tid, pid, "Worker", true),
+            Outcome::Kept
+        );
+        assert_eq!(CpuSet::of_thread(tid).unwrap(), cpus("1"));
     }
 }

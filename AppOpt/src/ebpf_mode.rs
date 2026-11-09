@@ -10,7 +10,8 @@ use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 
 use appopt_common::{
-    COMM_KEY_LEN, COMM_LEN, EVENT_EXEC, EVENT_EXIT, EVENT_RENAME, ProcEvent, TracepointOffsets,
+    COMM_KEY_LEN, COMM_LEN, EVENT_EXEC, EVENT_EXIT, EVENT_FORK, EVENT_RENAME, ProcEvent,
+    TracepointOffsets,
 };
 use aya::maps::{Array, HashMap as BpfHashMap, MapData, RingBuf};
 use aya::programs::TracePoint;
@@ -290,7 +291,7 @@ impl Ebpf {
         self.applied_clear();
         let walk = procfs::walk(cfg, |_| true)?;
         for (pid, group, tid, comm) in walk.threads() {
-            match self.cache.apply(cfg, group, tid, pid, &comm) {
+            match self.cache.apply(cfg, group, tid, pid, &comm, true) {
                 Outcome::Bound => self.applied_set(tid),
                 Outcome::Gone => self.applied_del(tid),
                 Outcome::Kept | Outcome::NoRule => {}
@@ -316,7 +317,7 @@ impl Ebpf {
             }
             EVENT_EXEC => {
                 if !matches!(
-                    self.bind(ev.pid, tid, comm, cfg),
+                    self.bind(ev.pid, tid, comm, cfg, true),
                     Outcome::Bound | Outcome::Kept
                 ) {
                     self.cache.remove(tid);
@@ -324,22 +325,36 @@ impl Ebpf {
                 }
             }
             EVENT_RENAME => {
-                self.bind(ev.pid, tid, comm, cfg);
+                self.bind(ev.pid, tid, comm, cfg, true);
             }
-            // FORK：子线程继承父线程的亲和性与 cpuset，内核态已占位，改名时才做完整处理
+            EVENT_FORK => self.bind_child(ev.pid, tid, comm, cfg),
             _ => {}
         }
     }
 
+    /// 新线程：父进程可能还没登记，内核会过滤掉它之后的改名事件，所以在这里绑定并登记。
+    /// 名字以 /proc 为准（上报后可能已改名），仍是继承来的名字时不按线程规则保留；
+    /// 登记后再读一次名字，补上登记前刚好改名的情况
+    fn bind_child(&mut self, pid: i32, tid: i32, inherited: &str, cfg: &AppConfig) {
+        let Some(name) = procfs::comm(tid) else {
+            return;
+        };
+        if self.bind(pid, tid, &name, cfg, name != inherited) == Outcome::Bound
+            && let Some(now) = procfs::comm(tid).filter(|n| *n != name)
+        {
+            self.bind(pid, tid, &now, cfg, true);
+        }
+    }
+
     /// comm 匹配包名，线程改名后回退到该进程主线程登记的包名
-    fn bind(&mut self, pid: i32, tid: i32, comm: &str, cfg: &AppConfig) -> Outcome {
+    fn bind(&mut self, pid: i32, tid: i32, comm: &str, cfg: &AppConfig, sticky: bool) -> Outcome {
         let group = cfg
             .pkg_for_comm(comm, || procfs::cmdline(pid))
             .or_else(|| self.cache.pkg_of(pid).and_then(|pkg| cfg.group(pkg)));
         let Some(group) = group else {
             return Outcome::NoRule;
         };
-        let outcome = self.cache.apply(cfg, group, tid, pid, comm);
+        let outcome = self.cache.apply(cfg, group, tid, pid, comm, sticky);
         match outcome {
             Outcome::Bound => self.applied_set(tid),
             Outcome::Gone => self.applied_del(tid),
