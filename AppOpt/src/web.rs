@@ -390,11 +390,21 @@ fn str_field<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v[key].as_str().map(str::trim)
 }
 
+/// 可选字符串字段：缺省或 null 视为未提供，类型不符返回 400
+fn opt_str<'a>(v: &'a Value, key: &str) -> Result<Option<&'a str>, ApiError> {
+    opt_field(
+        v,
+        key,
+        |x| x.as_str().map(str::trim),
+        || bad_request(format!("字段 {key} 的取值无效")),
+    )
+}
+
 fn rule_set(shared: &Shared, v: &Value) -> ApiResult {
     let (Some(pkg), Some(cpus)) = (str_field(v, "pkg"), str_field(v, "cpus")) else {
         return Err(bad_request("缺少 pkg 或 cpus 字段"));
     };
-    let thread = str_field(v, "thread").unwrap_or("");
+    let thread = opt_str(v, "thread")?.unwrap_or("");
     if !token_ok(pkg, MAX_PKG_LEN) || (!thread.is_empty() && !token_ok(thread, MAX_THREAD_LEN)) {
         return Err(bad_request("名称含有非法字符"));
     }
@@ -422,8 +432,11 @@ fn rule_del(shared: &Shared, v: &Value) -> ApiResult {
     let Some(pkg) = str_field(v, "pkg") else {
         return Err(bad_request("缺少 pkg 字段"));
     };
-    let thread = str_field(v, "thread").unwrap_or("");
-    let all = v["all"].as_bool().unwrap_or(false);
+    let thread = opt_str(v, "thread")?.unwrap_or("");
+    let all = opt_field(v, "all", Value::as_bool, || {
+        bad_request("字段 all 的取值无效")
+    })?
+    .unwrap_or(false);
     shared
         .edit_rules(|lines| {
             if all {
@@ -457,12 +470,12 @@ fn rule_rename(shared: &Shared, v: &Value) -> ApiResult {
 
 /// 输入补全：不带 pkg 时补全包名，带 pkg 时补全该进程的线程名
 fn suggest(v: &Value) -> ApiResult {
-    let q = str_field(v, "q").unwrap_or("");
+    let q = opt_str(v, "q")?.unwrap_or("");
     if q.len() > 64 {
         return Err(bad_request("q 过长"));
     }
     let io_err = |e: io::Error| api_err(500, format!("读取 /proc 失败: {e}"));
-    let counts = match str_field(v, "pkg").filter(|p| !p.is_empty()) {
+    let counts = match opt_str(v, "pkg")?.filter(|p| !p.is_empty()) {
         None => package_counts().map_err(io_err)?,
         Some(pkg) => {
             if !token_ok(pkg, MAX_PKG_LEN) {
@@ -705,6 +718,36 @@ mod tests {
             (after.mode, after.check_interval),
             (crate::settings::Mode::Proc, 7)
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn optional_fields_must_have_the_right_type() {
+        let (s, dir) = shared_fixture("optfields");
+        let conf = dir.join("applist.conf");
+        let expect_400 = |r: ApiResult, msg: &str| match r {
+            Err(ApiError(status, m)) => assert_eq!((status, m.as_str()), (400, msg)),
+            Ok(_) => panic!("应拒绝: {msg}"),
+        };
+        expect_400(
+            rule_set(&s, &json!({"pkg": "a", "thread": 7, "cpus": "1"})),
+            "字段 thread 的取值无效",
+        );
+        expect_400(
+            rule_del(&s, &json!({"pkg": "a", "thread": false})),
+            "字段 thread 的取值无效",
+        );
+        expect_400(
+            rule_del(&s, &json!({"pkg": "a", "all": "true"})),
+            "字段 all 的取值无效",
+        );
+        expect_400(suggest(&json!({"q": 1})), "字段 q 的取值无效");
+        expect_400(suggest(&json!({"pkg": 5, "q": "x"})), "字段 pkg 的取值无效");
+        assert_eq!(fs::read_to_string(&conf).unwrap(), "a=0\n");
+
+        // null 仍视为未提供
+        assert!(rule_set(&s, &json!({"pkg": "a", "thread": null, "cpus": "1"})).is_ok());
+        assert_eq!(fs::read_to_string(&conf).unwrap(), "a=1\n");
         fs::remove_dir_all(&dir).unwrap();
     }
 }
