@@ -46,7 +46,6 @@ fn offsets_load() -> Option<TracepointOffsets> {
     })
 }
 
-/// 事件元信息
 struct EventMeta {
     pid: i32,
     tid: i32,
