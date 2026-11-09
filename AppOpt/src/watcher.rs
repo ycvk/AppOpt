@@ -94,15 +94,7 @@ fn watch_dir(config_file: &str) -> PathBuf {
 pub fn spawn(shared: Arc<Shared>) -> io::Result<JoinHandle<()>> {
     thread::Builder::new()
         .name("ConfigWatcher".into())
-        .spawn(move || {
-            loop {
-                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&shared))).is_err()
-                {
-                    eprintln!("警告: ConfigWatcher 异常退出，1 秒后重启");
-                    thread::sleep(Duration::from_secs(1));
-                }
-            }
-        })
+        .spawn(move || run(&shared))
 }
 
 fn run(shared: &Shared) {

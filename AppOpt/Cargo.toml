@@ -20,8 +20,13 @@ serde_json = "1"
 aya = "0.16"
 appopt-common = { path = "../AppOpt-common", features = ["user"] }
 
+# 任何线程 panic 都终止整个进程，不留下锁中毒、半工作的守护进程
+[profile.dev]
+panic = "abort"
+
 [profile.release]
 opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true
+panic = "abort"
