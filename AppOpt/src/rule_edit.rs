@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::grammar::{Node, OuterLine, comment_at, parse_outer, scan};
+use crate::grammar::{Node, OuterLine, comment_at, parse_outer, scan, strip_comment};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum EditError {
@@ -201,7 +201,8 @@ fn normalize_singles(lines: &mut Vec<String>, pkg: &str) {
 
 /// 把独立的包级行 i 扩成块，块内放入 items
 fn expand_block(lines: &mut Vec<String>, i: usize, items: impl IntoIterator<Item = String>) {
-    lines[i] = format!("{} {{", lines[i].trim_end());
+    let open = format!("{} {{", strip_comment(&lines[i]).trim_end());
+    lines[i] = with_comment(&open, &lines[i]);
     lines.splice(i + 1..i + 1, items.into_iter().chain(["}".to_string()]));
 }
 
@@ -266,15 +267,20 @@ pub fn upsert(
                 lines[i] = spec_swap(&lines[i], cpus);
             }
             Some(PkgLine::BarePending(i)) => {
-                lines[i] = with_comment(&format!("{pkg}={cpus} {{"), &lines[i]);
+                let mut line = with_comment(&format!("{pkg}={cpus} {{"), &lines[i]);
+                // 单独成行的 `{` 并入包名行，其注释接在后面
                 if let Some(open) = t.block_open
                     && matches!(
                         parse_outer(lines[open].trim()),
                         OuterLine::BareOpen { pkg: "" }
                     )
                 {
-                    lines.remove(open);
+                    let brace = lines.remove(open);
+                    if let Some(at) = comment_at(&brace) {
+                        line.push_str(&brace[at..]);
+                    }
                 }
+                lines[i] = line;
             }
             Some(PkgLine::BareOpen(i)) => {
                 lines[i] = with_comment(&format!("{pkg}={cpus} {{"), &lines[i]);
@@ -312,7 +318,9 @@ pub fn delete(lines: &mut Vec<String>, pkg: &str, thread: &str) -> Result<(), Ed
             Some(PkgLine::Standalone(i)) => {
                 lines.remove(i);
             }
-            Some(PkgLine::OpenInline(i)) => lines[i] = bare_open_line(pkg),
+            Some(PkgLine::OpenInline(i)) => {
+                lines[i] = with_comment(&bare_open_line(pkg), &lines[i])
+            }
             _ => return Err(EditError::NotFound),
         }
     } else if let Some(locs) = t.threads.get(thread) {
@@ -402,10 +410,11 @@ pub fn rename(lines: &mut Vec<String>, old: &str, new: &str) -> Result<(), EditE
         for i in idxs {
             let line = lines[i].trim();
             let rest = line.strip_prefix(old).expect("规则行以包名开头");
-            let tail = match (new.contains('='), rest.trim()) {
-                (true, "" | "=") => "=",
-                (true, "{") => "= {",
-                _ => rest,
+            // 含 `=` 的包名在 `pkg` / `pkg {` 形态下要补写 `=`，否则会被读成 `pkg=cpus`
+            let tail = match (new.contains('='), strip_comment(rest).trim()) {
+                (true, "" | "=") => with_comment("=", rest),
+                (true, "{") => with_comment("= {", rest),
+                _ => rest.to_string(),
             };
             lines[i] = format!("{new}{tail}");
         }
@@ -523,5 +532,52 @@ mod tests {
         let mut l = lines("a=0\nz=1");
         assert_eq!(rename(&mut l, "a", "z"), Err(EditError::Conflict));
         assert_eq!(rename(&mut l, "q", "w"), Err(EditError::NotFound));
+    }
+
+    #[test]
+    fn edits_keep_end_of_line_comments() {
+        type Edit = fn(&mut Vec<String>) -> Result<(), EditError>;
+        let cases: [(&str, Edit, &str); 6] = [
+            // 带注释的包级行扩成块时，`{` 写在注释之前
+            (
+                "a=0 # 说明",
+                |l| upsert(l, "a", "T", "1"),
+                "a=0 { # 说明\n\tT=1\n}",
+            ),
+            (
+                "a=0 # 说明\na{T}=1",
+                |l| upsert(l, "a", "U", "2"),
+                "a=0 { # 说明\n\tT=1\n\tU=2\n}",
+            ),
+            // 删包级规则时保留块开头行的注释
+            (
+                "a=0 { # 说明\n T=1\n}",
+                |l| delete(l, "a", ""),
+                "a { # 说明\n T=1\n}",
+            ),
+            // 合并单独成行的 `{` 时带上它的注释
+            (
+                "a # x\n{ # y\n T=1\n}",
+                |l| upsert(l, "a", "", "2"),
+                "a=2 { # x # y\n T=1\n}",
+            ),
+            // 改名为含 `=` 的包名时，注释不影响补写的 `=`
+            (
+                "a # c\n{\n T=1\n}",
+                |l| rename(l, "a", "p=q"),
+                "p=q= # c\n{\n T=1\n}",
+            ),
+            (
+                "a { # c\n T=1\n}",
+                |l| rename(l, "a", "p=q"),
+                "p=q= { # c\n T=1\n}",
+            ),
+        ];
+        for (src, f, want) in cases {
+            let out = edit(src, f);
+            assert_eq!(out, want, "输入:\n{src}");
+            let l = lines(&out);
+            assert_eq!(scan(&l).malformed, 0, "结果无法完整解析:\n{out}");
+        }
     }
 }
