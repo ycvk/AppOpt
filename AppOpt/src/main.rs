@@ -20,7 +20,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let prog = args.first().map_or("AppOpt", String::as_str);
 
-    match cli::parse(&args[1..]) {
+    match cli::parse(args.get(1..).unwrap_or_default()) {
         Ok(Command::Run(overrides)) => run(overrides),
         Ok(Command::Version) => {
             let suffix = if ebpf_mode::available() { " eBPF" } else { "" };
