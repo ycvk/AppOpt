@@ -1,528 +1,350 @@
-use std::collections::HashSet;
-use std::ffi::CString;
+//! 规则配置：由 applist.conf 文本解析出按包索引的规则集
+
+use std::collections::HashMap;
 use std::fs;
-use std::io;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, UNIX_EPOCH};
+use std::io::{self, Write};
+use std::path::Path;
+use std::sync::Arc;
 
-use crate::{lock_ignore_poison, CONFIG_UPDATED, MAX_PKG_LEN, MAX_THREAD_LEN};
-use crate::cpuset::{base_cpuset, create_cpuset_dir, parse_cpu_spec, CpuSet, CpuTopology};
+use crate::cpuset::{CpuSet, CpuTopology, CpusetFs};
+use crate::grammar::{Node, scan};
 
-pub static INOTIFY_SUPPORTED: AtomicBool = AtomicBool::new(false);
-pub static INOTIFY_FD: AtomicI32 = AtomicI32::new(-1);
-pub static INOTIFY_WD: AtomicI32 = AtomicI32::new(-1);
+pub const MAX_PKG_LEN: usize = 128;
+pub const MAX_THREAD_LEN: usize = 32;
 
-/// 运行时可调参数，web 端热更新
-pub static CHECK_INTERVAL: AtomicU64 = AtomicU64::new(2);
-pub static FORCE_RELOAD: AtomicBool = AtomicBool::new(false);
-pub static CONFIG_FILE: Mutex<String> = Mutex::new(String::new());
+const NEW_FILE_HEADER: &str = "# 规则编写与使用说明请参考 http://AppOpt.suto.top\n\n";
 
-pub struct AffinityRule {
-    pub pkg: String,
+/// 规则文件不存在时创建带说明头的空文件，返回是否新建
+pub fn ensure_file(path: &Path) -> io::Result<bool> {
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut f) => f.write_all(NEW_FILE_HEADER.as_bytes()).map(|()| true),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// 一条规则，thread 为空表示包级规则
+pub struct RuleItem {
     pub thread: String,
-    pub thread_pattern: CString,
-    pub cpuset_dir: String,
     pub cpus: CpuSet,
 }
 
-pub struct AppConfig {
-    pub rules: Vec<AffinityRule>,
-    pub pkgs: HashSet<String>,
-    pub has_thread_rules: HashSet<String>,
-    pub topo: CpuTopology,
+/// 同一包名下的全部规则，保持文件中的出现顺序
+pub struct PkgGroup {
+    pub pkg: Arc<str>,
+    pub items: Vec<RuleItem>,
+    /// 全部包级规则的并集
+    pkg_cpus: Option<CpuSet>,
+    has_thread_rules: bool,
 }
 
-pub static CURRENT_CONFIG: Mutex<Option<Arc<AppConfig>>> = Mutex::new(None);
+/// 线程应得的绑定
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Resolved {
+    pub cpus: CpuSet,
+    /// 来自线程规则（而非包级规则或兜底）
+    pub thread_rule: bool,
+}
 
-pub static PARSE_FAILS: AtomicUsize = AtomicUsize::new(0);
-
-/// 校验 CPU 规格形态
-pub fn spec_like(s: &str) -> bool {
-    let mut any = false;
-    for part in s.split(',') {
-        let t = part.trim();
-        if t.is_empty() {
-            continue;
-        }
-        any = true;
-        let ok = matches!(t, "e-core" | "p-core" | "hp-core" | "all-core")
-            || t.bytes().all(|b| b.is_ascii_digit())
-            || t.split_once('-').is_some_and(|(a, b)| {
-                !a.is_empty()
-                    && !b.is_empty()
-                    && a.bytes().all(|b| b.is_ascii_digit())
-                    && b.bytes().all(|b| b.is_ascii_digit())
-            });
-        if !ok {
-            return false;
+impl PkgGroup {
+    fn new(pkg: &str) -> Self {
+        Self {
+            pkg: pkg.into(),
+            items: Vec::new(),
+            pkg_cpus: None,
+            has_thread_rules: false,
         }
     }
-    any
-}
 
-pub fn comment_at(s: &str) -> Option<usize> {
-    let mut prev_ws = false;
-    for (i, c) in s.char_indices() {
-        if prev_ws && (c == '#' || (c == '/' && s[i..].starts_with("//"))) {
-            return Some(s[..i].trim_end().len());
-        }
-        prev_ws = c.is_whitespace();
-    }
-    None
-}
-
-pub fn strip_comment(s: &str) -> &str {
-    &s[..comment_at(s).unwrap_or(s.len())]
-}
-
-pub fn split_rule_line(p: &str) -> Option<(&str, &str, bool)> {
-    let p = strip_comment(p);
-    fn kv(s: &str) -> Option<(&str, &str)> {
-        s.rfind('=')
-            .map(|eq| (s[..eq].trim(), s[eq + 1..].trim()))
-            .filter(|(k, _)| !k.is_empty())
-    }
-    p.match_indices('}')
-        .find_map(|(cb, _)| kv(&p[..cb]).map(|(k, v)| (k, v, true)))
-        .or_else(|| kv(p).map(|(k, v)| (k, v, false)))
-}
-
-pub fn close_like(p: &str) -> bool {
-    p.strip_prefix('}').is_some_and(|r| {
-        r.is_empty() || r.starts_with(char::is_whitespace) || r.starts_with('#') || r.starts_with("//")
-    })
-}
-
-pub fn split_single_line(body: &str) -> Option<(&str, &str, &str)> {
-    let eq = body.rfind('=')?;
-    let cpus = body[eq + 1..].trim();
-    let left = body[..eq].trim_end().strip_suffix('}')?.trim_end();
-    let ob = left.find('{')?;
-    let (pkg, thread) = (left[..ob].trim(), left[ob + 1..].trim());
-    (!pkg.is_empty() && !thread.is_empty()).then_some((pkg, thread, cpus))
-}
-
-pub enum OuterLine<'a> {
-    Rule { pkg: &'a str, cpus: &'a str, open: bool },
-    BareOpen { pkg: &'a str },
-    Pending { pkg: &'a str },
-    Single { pkg: &'a str, thread: &'a str, cpus: &'a str, open: bool },
-    Junk,
-}
-
-pub fn parse_outer(p: &str) -> OuterLine<'_> {
-    let p = strip_comment(p);
-    let (open, body) = match p.strip_suffix('{') {
-        Some(b) => (true, b.trim_end()),
-        None => (false, p),
-    };
-    if let Some((pkg, thread, cpus)) = split_single_line(body) {
-        return OuterLine::Single { pkg, thread, cpus, open };
-    }
-    if !open && close_like(body) {
-        return OuterLine::Junk;
-    }
-    match body.rfind('=') {
-        Some(eq) => {
-            let (pkg, cpus) = (body[..eq].trim(), body[eq + 1..].trim());
-            if cpus.is_empty() {
-                return if open {
-                    OuterLine::BareOpen { pkg }
-                } else {
-                    OuterLine::Pending { pkg }
-                };
-            }
-            OuterLine::Rule { pkg, cpus, open }
-        }
-        None => {
-            if open {
-                OuterLine::BareOpen { pkg: body }
-            } else {
-                OuterLine::Pending { pkg: body }
-            }
-        }
-    }
-}
-
-fn add_rule(
-    rules: &mut Vec<AffinityRule>,
-    topo: &CpuTopology,
-    pkg: &str,
-    thread: &str,
-    cpus_spec: &str,
-) -> bool {
-    if pkg.is_empty() || pkg.len() >= MAX_PKG_LEN || thread.len() >= MAX_THREAD_LEN {
-        return false;
-    }
-    if pkg.bytes().chain(thread.bytes()).any(|b| b < 0x20 || b == 0x7f) {
-        return false;
-    }
-    if !spec_like(cpus_spec) {
-        return false;
-    }
-    let set = parse_cpu_spec(cpus_spec, topo);
-    if set.count() == 0 {
-        return false;
-    }
-    let cpuset_dir = if thread.is_empty() {
-        let dir_name = set.to_range_string();
-        if topo.cpuset_enabled {
-            let path = format!("{}/{}", base_cpuset(), dir_name);
-            if create_cpuset_dir(&path, &dir_name, &topo.mems_str) { dir_name } else { Default::default() }
+    fn push(&mut self, thread: &str, cpus: CpuSet) {
+        if thread.is_empty() {
+            self.pkg_cpus = Some(self.pkg_cpus.map_or(cpus, |acc| acc.union(&cpus)));
         } else {
-            String::new()
+            self.has_thread_rules = true;
         }
-    } else {
-        String::new()
-    };
-    rules.push(AffinityRule {
-        pkg: pkg.to_string(),
-        thread: thread.to_string(),
-        thread_pattern: CString::new(thread).unwrap_or_default(),
-        cpuset_dir,
-        cpus: set,
-    });
-    true
-}
-
-/// 加载配置文件，返回 None 表示未变化或解析失败
-pub fn load_config(
-    config_file: &str,
-    topo: &CpuTopology,
-    last_mtime: &mut i64,
-) -> Option<AppConfig> {
-    let metadata = fs::metadata(config_file).ok()?;
-    let mtime = metadata
-        .modified()
-        .ok()?
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_nanos() as i64;
-
-    if *last_mtime == mtime && *last_mtime != -1 {
-        return None;
+        self.items.push(RuleItem {
+            thread: thread.to_string(),
+            cpus,
+        });
     }
 
-    let content = fs::read_to_string(config_file).ok()?;
+    pub fn has_thread_rules(&self) -> bool {
+        self.has_thread_rules
+    }
 
-    let mut rules: Vec<AffinityRule> = Vec::new();
-    let mut fail_cnt: usize = 0;
-    let mut cur_pkg = String::new();
-    let mut pending_pkg = String::new();
-    let mut in_block = false;
-
-    for line in content.lines() {
-        let p = line.trim();
-        if p.is_empty() || p.starts_with('#') || p.starts_with("//") {
-            continue;
+    /// 线程规则按通配匹配并累加；无线程匹配时取包级并集；
+    /// 仅有线程规则的包，未命中的线程恢复到全部核心；没有任何规则返回 None
+    pub fn resolve(&self, thread: &str, present: &CpuSet) -> Option<Resolved> {
+        if !thread.is_empty() {
+            let hit = self
+                .items
+                .iter()
+                .filter(|r| !r.thread.is_empty() && crate::glob::matches(&r.thread, thread))
+                .fold(None::<CpuSet>, |acc, r| {
+                    Some(acc.map_or(r.cpus, |a| a.union(&r.cpus)))
+                });
+            if let Some(cpus) = hit {
+                return Some(Resolved {
+                    cpus,
+                    thread_rule: true,
+                });
+            }
         }
-
-        if in_block {
-            if close_like(p) {
-                in_block = false;
-                cur_pkg.clear();
-                continue;
-            }
-            match split_rule_line(p) {
-                Some((thread, cpus, closed)) => {
-                    if !add_rule(&mut rules, topo, &cur_pkg, thread, cpus) {
-                        fail_cnt += 1;
-                    }
-                    if closed {
-                        in_block = false;
-                        cur_pkg.clear();
-                    }
-                }
-                None => {
-                    fail_cnt += 1;
-                    if p.contains('}') {
-                        in_block = false;
-                        cur_pkg.clear();
-                    }
-                }
-            }
-            continue;
+        match self.pkg_cpus {
+            Some(cpus) => Some(Resolved {
+                cpus,
+                thread_rule: false,
+            }),
+            None if self.has_thread_rules => Some(Resolved {
+                cpus: *present,
+                thread_rule: false,
+            }),
+            None => None,
         }
+    }
+}
 
-        match parse_outer(p) {
-            OuterLine::Single { pkg, thread, cpus, open } => {
-                if !pending_pkg.is_empty() {
-                    fail_cnt += 1;
+/// 解析后的规则集，连同其绑定的设备环境
+pub struct AppConfig {
+    groups: Vec<PkgGroup>,
+    index: HashMap<Arc<str>, usize>,
+    rule_count: usize,
+    /// 被拒绝或无法解析的行数
+    pub parse_fails: usize,
+    /// 解析时逐行记录的问题说明
+    pub issues: Vec<String>,
+    pub topo: CpuTopology,
+    pub cpusets: Option<Arc<CpusetFs>>,
+}
+
+fn name_error(pkg: &str, thread: &str) -> Option<&'static str> {
+    let control = |s: &str| s.bytes().any(|b| b < 0x20 || b == 0x7f);
+    if pkg.is_empty() || pkg.len() >= MAX_PKG_LEN {
+        Some("包名为空或过长")
+    } else if thread.len() >= MAX_THREAD_LEN {
+        Some("线程名过长")
+    } else if control(pkg) || control(thread) {
+        Some("名称含控制字符")
+    } else {
+        None
+    }
+}
+
+impl AppConfig {
+    pub fn parse(text: &str, topo: CpuTopology, cpusets: Option<Arc<CpusetFs>>) -> Self {
+        let lines: Vec<&str> = text.lines().collect();
+        let parsed = scan(&lines);
+        let mut cfg = Self {
+            groups: Vec::new(),
+            index: HashMap::new(),
+            rule_count: 0,
+            parse_fails: parsed.malformed,
+            issues: Vec::new(),
+            topo,
+            cpusets,
+        };
+
+        for (i, node) in &parsed.nodes {
+            let line = i + 1;
+            let (pkg, thread, spec) = match *node {
+                Node::Pkg { pkg, cpus, .. } => (pkg, "", cpus),
+                Node::Single {
+                    pkg, thread, cpus, ..
                 }
-                pending_pkg.clear();
-                if !add_rule(&mut rules, topo, pkg, thread, cpus) {
-                    fail_cnt += 1;
-                }
-                if open {
-                    cur_pkg = pkg.to_string();
-                    in_block = true;
-                }
-            }
-            OuterLine::Rule { pkg, cpus, open } => {
-                if !pending_pkg.is_empty() {
-                    fail_cnt += 1;
-                }
-                if !add_rule(&mut rules, topo, pkg, "", cpus) {
-                    fail_cnt += 1;
-                }
-                if open {
-                    cur_pkg = pkg.to_string();
-                    in_block = true;
-                }
-                pending_pkg.clear();
-            }
-            OuterLine::BareOpen { pkg } => {
-                let owner = if !pkg.is_empty() {
-                    if !pending_pkg.is_empty() {
-                        fail_cnt += 1;
-                    }
-                    pkg.to_string()
-                } else {
-                    pending_pkg.clone()
-                };
-                if owner.is_empty() {
-                    fail_cnt += 1;
+                | Node::Member {
+                    pkg, thread, cpus, ..
+                } => (pkg, thread, cpus),
+                Node::BadMember { .. } | Node::Junk => {
+                    cfg.issues.push(format!("第 {line} 行无法解析"));
                     continue;
                 }
-                cur_pkg = owner;
-                pending_pkg.clear();
-                in_block = true;
-            }
-            OuterLine::Pending { pkg } => {
-                if !pending_pkg.is_empty() {
-                    fail_cnt += 1;
+                _ => continue,
+            };
+            let resolved = match name_error(pkg, thread) {
+                Some(why) => Err(why.to_string()),
+                None => cfg.topo.parse_spec(spec).map_err(|e| e.to_string()),
+            };
+            match resolved {
+                Ok(cpus) => cfg.add(pkg, thread, cpus),
+                Err(why) => {
+                    cfg.parse_fails += 1;
+                    cfg.issues.push(format!("第 {line} 行被忽略: {why}"));
                 }
-                pending_pkg = pkg.to_string();
-            }
-            OuterLine::Junk => {
-                fail_cnt += 1;
-                pending_pkg.clear();
             }
         }
+        cfg
     }
 
-    if in_block || !pending_pkg.is_empty() {
-        fail_cnt += 1;
-    }
-
-    *last_mtime = mtime;
-    PARSE_FAILS.store(fail_cnt, Ordering::Relaxed);
-
-    let pkgs: HashSet<String> = rules.iter().map(|r| r.pkg.clone()).collect();
-    let has_thread_rules: HashSet<String> = rules
-        .iter()
-        .filter(|r| !r.thread.is_empty())
-        .map(|r| r.pkg.clone())
-        .collect();
-    let num_rules = rules.len();
-
-    println!("配置文件解析完成，共加载 {} 条规则", num_rules);
-    if fail_cnt > 0 {
-        eprintln!("警告: {} 条规则因格式无效被跳过", fail_cnt);
-    }
-
-    Some(AppConfig {
-        rules,
-        pkgs,
-        has_thread_rules,
-        topo: topo.clone(),
-    })
-}
-
-pub fn config_loader() {
-    let name = CString::new("ConfigLoader").unwrap();
-    unsafe {
-        libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
-    }
-
-    let mut last_mtime: i64 = -1;
-
-    loop {
-        let interval = CHECK_INTERVAL.load(Ordering::Relaxed).max(1);
-        if FORCE_RELOAD.swap(false, Ordering::AcqRel) {
-            last_mtime = -1;
-            if INOTIFY_SUPPORTED.load(Ordering::Acquire) {
-                let fd = INOTIFY_FD.load(Ordering::Acquire);
-                inotify_rewatch(fd);
+    fn add(&mut self, pkg: &str, thread: &str, cpus: CpuSet) {
+        let gi = match self.index.get(pkg) {
+            Some(&gi) => gi,
+            None => {
+                let group = PkgGroup::new(pkg);
+                self.index.insert(group.pkg.clone(), self.groups.len());
+                self.groups.push(group);
+                self.groups.len() - 1
             }
-            config_reload(&mut last_mtime);
-        }
-        if INOTIFY_SUPPORTED.load(Ordering::Acquire) {
-            inotify_handle(interval, &mut last_mtime);
-        } else {
-            config_reload(&mut last_mtime);
-            thread::sleep(Duration::from_secs(interval));
-        }
-    }
-}
-
-pub fn init_inotify(config_file: &str) {
-    let inotify_fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
-    if inotify_fd < 0 {
-        println!("inotify初始化失败，使用轮询模式");
-        return;
-    }
-    let cfg_cstr = match CString::new(config_file) {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("错误: 配置文件路径包含非法字符，使用轮询模式");
-            unsafe { libc::close(inotify_fd); }
-            return;
-        }
-    };
-    let wd = unsafe {
-        libc::inotify_add_watch(
-            inotify_fd,
-            cfg_cstr.as_ptr(),
-            libc::IN_CLOSE_WRITE | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF,
-        )
-    };
-    if wd >= 0 {
-        INOTIFY_SUPPORTED.store(true, Ordering::Release);
-        INOTIFY_FD.store(inotify_fd, Ordering::Release);
-        INOTIFY_WD.store(wd, Ordering::Release);
-        println!("启用inotify监控配置文件变更");
-    } else {
-        unsafe {
-            libc::close(inotify_fd);
-        }
-        println!("inotify初始化失败，使用轮询模式");
-    }
-}
-
-fn disable_inotify(inotify_fd: i32) {
-    INOTIFY_SUPPORTED.store(false, Ordering::Release);
-    unsafe {
-        libc::close(inotify_fd);
-    }
-    INOTIFY_FD.store(-1, Ordering::Release);
-    INOTIFY_WD.store(-1, Ordering::Release);
-}
-
-fn config_reload(last_mtime: &mut i64) {
-    let Some(cfg) = lock_ignore_poison(&CURRENT_CONFIG).clone() else {
-        return;
-    };
-    let file = lock_ignore_poison(&CONFIG_FILE).clone();
-    let Some(new_cfg) = load_config(&file, &cfg.topo, last_mtime) else {
-        return;
-    };
-    {
-        let mut guard = lock_ignore_poison(&CURRENT_CONFIG);
-        *guard = Some(Arc::new(new_cfg));
-    }
-    CONFIG_UPDATED.store(true, Ordering::Release);
-}
-
-pub fn config_reload_now() {
-    let mut mtime: i64 = -1;
-    config_reload(&mut mtime);
-}
-
-fn inotify_handle(interval: u64, last_mtime: &mut i64) {
-    let inotify_fd = INOTIFY_FD.load(Ordering::Acquire);
-
-    let mut pfd = libc::pollfd {
-        fd: inotify_fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-
-    let ret = unsafe { libc::poll(&mut pfd, 1, (interval as libc::c_int) * 1000) };
-
-    if ret < 0 {
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EINTR) {
-            return;
-        }
-        disable_inotify(inotify_fd);
-        return;
-    } else if ret == 0 {
-        return;
-    }
-
-    #[repr(align(8))]
-    struct InotifyBuf([u8; 4096]);
-    let mut buf = InotifyBuf([0u8; 4096]);
-    let mut reload_needed = false;
-    let mut needs_rewatch = false;
-    let hdr = std::mem::size_of::<libc::inotify_event>();
-
-    loop {
-        let len = unsafe {
-            libc::read(
-                inotify_fd,
-                buf.0.as_mut_ptr() as *mut libc::c_void,
-                buf.0.len(),
-            )
         };
-        if len <= 0 {
-            let err = io::Error::last_os_error();
-            let errno = err.raw_os_error();
-            if errno == Some(libc::EAGAIN)
-                || errno == Some(libc::EWOULDBLOCK)
-                || errno == Some(libc::EINTR)
-            {
-                break;
-            }
-            disable_inotify(inotify_fd);
-            return;
-        }
-
-        let mut offset = 0;
-        while offset + hdr <= len as usize {
-            let event = unsafe { &*(buf.0.as_ptr().add(offset) as *const libc::inotify_event) };
-            if event.mask & (libc::IN_CLOSE_WRITE | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0
-            {
-                reload_needed = true;
-                *last_mtime = -1;
-                if event.mask & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0 {
-                    needs_rewatch = true;
-                }
-            }
-            offset += hdr + event.len as usize;
-        }
+        self.groups[gi].push(thread, cpus);
+        self.rule_count += 1;
     }
 
-    if needs_rewatch {
-        thread::sleep(Duration::from_secs(interval));
-        if !inotify_rewatch(inotify_fd) {
-            return;
-        }
+    pub fn groups(&self) -> &[PkgGroup] {
+        &self.groups
     }
 
-    if reload_needed {
-        config_reload(last_mtime);
+    pub fn group(&self, pkg: &str) -> Option<&PkgGroup> {
+        self.index.get(pkg).map(|&gi| &self.groups[gi])
+    }
+
+    pub fn rule_count(&self) -> usize {
+        self.rule_count
+    }
+
+    /// 内核 comm 最长 15 字节，长包名会被截成前缀或后缀；
+    /// 恰好等于包名直接命中，否则 comm 写满 15 字节且可能是某包名的截断时，再用完整 cmdline 判定
+    pub fn pkg_for_comm(
+        &self,
+        comm: &str,
+        cmdline: impl FnOnce() -> Option<String>,
+    ) -> Option<&PkgGroup> {
+        if let Some(group) = self.group(comm) {
+            return Some(group);
+        }
+        let truncated = comm.len() >= 15
+            && self
+                .groups
+                .iter()
+                .any(|g| g.pkg.starts_with(comm) || g.pkg.ends_with(comm));
+        if truncated {
+            cmdline().and_then(|name| self.group(&name))
+        } else {
+            None
+        }
     }
 }
 
-fn inotify_rewatch(inotify_fd: i32) -> bool {
-    let inotify_wd = INOTIFY_WD.load(Ordering::Acquire);
-    unsafe {
-        libc::inotify_rm_watch(inotify_fd, inotify_wd as u32);
-    }
-    let cfg_cstr = match CString::new(lock_ignore_poison(&CONFIG_FILE).clone()) {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("错误: 配置文件路径包含非法字符，降级为轮询模式");
-            disable_inotify(inotify_fd);
-            return false;
-        }
-    };
-    let new_wd = unsafe {
-        libc::inotify_add_watch(
-            inotify_fd,
-            cfg_cstr.as_ptr(),
-            libc::IN_CLOSE_WRITE | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF,
-        )
-    };
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    if new_wd < 0 {
-        disable_inotify(inotify_fd);
-        return false;
+    fn topo() -> CpuTopology {
+        let set = |s| CpuSet::parse_list(s).unwrap();
+        CpuTopology::from_groups(
+            set("0-7"),
+            [(1, set("0-3")), (2, set("4-6")), (3, set("7"))],
+        )
     }
-    INOTIFY_WD.store(new_wd, Ordering::Release);
-    true
+
+    fn cfg(text: &str) -> AppConfig {
+        AppConfig::parse(text, topo(), None)
+    }
+
+    fn set(s: &str) -> CpuSet {
+        CpuSet::parse_list(s).unwrap()
+    }
+
+    #[test]
+    fn rules_group_by_package_in_file_order() {
+        let c = cfg("b=e-core\na {\n RenderThread=hp-core\n}\nb{T}=0\na=p-core\n");
+        let names: Vec<&str> = c.groups().iter().map(|g| &*g.pkg).collect();
+        assert_eq!(names, ["b", "a"]);
+        assert_eq!(c.rule_count(), 4);
+        assert_eq!(c.parse_fails, 0);
+        let b = c.group("b").unwrap();
+        assert_eq!(b.items.len(), 2);
+        assert!(b.has_thread_rules());
+    }
+
+    #[test]
+    fn resolve_thread_then_package_then_fallback() {
+        let c = cfg("a=e-core {\n Render*=hp-core\n Render?=p-core\n}\nonly {\n X=0\n}\nplain=1\n");
+        let present = c.topo.present;
+        let a = c.group("a").unwrap();
+        // 线程规则累加
+        let r = a.resolve("RenderT", &present).unwrap();
+        assert_eq!((r.cpus, r.thread_rule), (set("4-7"), true));
+        // 未命中线程回落到包级
+        let r = a.resolve("other", &present).unwrap();
+        assert_eq!((r.cpus, r.thread_rule), (set("0-3"), false));
+        // 空线程名只看包级
+        assert_eq!(a.resolve("", &present).unwrap().cpus, set("0-3"));
+        // 仅线程规则的包：未命中线程恢复全部核心
+        let only = c.group("only").unwrap();
+        assert_eq!(only.resolve("Y", &present).unwrap().cpus, present);
+        assert_eq!(only.resolve("X", &present).unwrap().cpus, set("0"));
+        // 仅包级规则
+        assert_eq!(
+            c.group("plain")
+                .unwrap()
+                .resolve("Any", &present)
+                .unwrap()
+                .cpus,
+            set("1")
+        );
+        assert!(c.group("absent").is_none());
+    }
+
+    #[test]
+    fn duplicate_package_rules_union() {
+        let c = cfg("a=0-1\na=4\n");
+        assert_eq!(
+            c.group("a")
+                .unwrap()
+                .resolve("", &c.topo.present)
+                .unwrap()
+                .cpus,
+            set("0-1,4")
+        );
+    }
+
+    #[test]
+    fn bad_rules_are_counted_with_reason() {
+        let c = cfg("ok=0-1\nbad=zzz\nnone=9\n=3\n");
+        assert_eq!(c.rule_count(), 1);
+        assert_eq!(c.parse_fails, 3);
+        assert_eq!(c.issues.len(), 3);
+        assert!(c.issues[0].contains("第 2 行"));
+        let c = cfg(&format!("{}=0\n", "x".repeat(MAX_PKG_LEN)));
+        assert_eq!((c.rule_count(), c.parse_fails), (0, 1));
+        let c = cfg("a {\n a\u{7}b=0\n}\n");
+        assert_eq!((c.rule_count(), c.parse_fails), (0, 1));
+    }
+
+    #[test]
+    fn comm_lookup_handles_truncated_names() {
+        let c = cfg("com.tencent.mobileqq=0\nsurfaceflinger=1\n");
+        let full = || Some("com.tencent.mobileqq".to_string());
+        assert!(c.pkg_for_comm("surfaceflinger", || None).is_some());
+        // 后缀截断
+        assert_eq!(
+            &*c.pkg_for_comm("encent.mobileqq", full).unwrap().pkg,
+            "com.tencent.mobileqq"
+        );
+        // 前缀截断
+        assert!(c.pkg_for_comm("com.tencent.mob", full).is_some());
+        // 短名不读取 cmdline
+        assert!(
+            c.pkg_for_comm("nothing", || panic!("不应读取 cmdline"))
+                .is_none()
+        );
+        // cmdline 不在规则中
+        assert!(
+            c.pkg_for_comm("encent.mobileqq", || Some("other".into()))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn shipped_sample_config_loads_cleanly() {
+        let text = include_str!("../../module/applist.conf");
+        let c = cfg(text);
+        assert_eq!(c.parse_fails, 0, "{:?}", c.issues);
+        assert!(c.group("com.tencent.mm").unwrap().has_thread_rules());
+        assert!(c.group("surfaceflinger").is_some());
+    }
 }

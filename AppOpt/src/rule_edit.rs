@@ -1,35 +1,43 @@
+//! 规则文件的行级编辑：新增/更新、删除、重命名，保留注释与原有书写形态
+
 use std::collections::HashMap;
-use std::fs;
-use std::io::Write;
-use std::sync::Mutex;
 
-use crate::config::{close_like, comment_at, parse_outer, split_rule_line, split_single_line, strip_comment, OuterLine};
+use crate::grammar::{
+    Node, OuterLine, comment_at, parse_outer, scan, split_single_line, strip_comment,
+};
 
-pub enum RuleEdit {
-    Ok,
+#[derive(Debug, PartialEq, Eq)]
+pub enum EditError {
     NotFound,
+    /// 重命名的目标包名已有规则
     Conflict,
+    /// 文件存在未闭合的块，无法确定插入位置
     Malformed,
-    IoErr,
 }
 
-static WRITE_LOCK: Mutex<()> = Mutex::new(());
-
 enum PkgLine {
+    /// `pkg=cpus`
     Standalone(usize),
+    /// `pkg=cpus {`
     OpenInline(usize),
+    /// `pkg {`
     BareOpen(usize),
+    /// `pkg` / `pkg=` 单独成行，`{` 在后续行
     BarePending(usize),
 }
 
 #[derive(Clone, Copy)]
 struct ThreadLoc {
     idx: usize,
+    /// 单行形态 `pkg{thread}=cpus`
     single: bool,
+    /// 块内行同时以 `}` 收束
     closed: bool,
+    /// 单行形态同时开启块
     open: bool,
 }
 
+/// 目标包在文件中的位置信息；块只记录该包的第一个块
 struct Target {
     pkg_line: Option<PkgLine>,
     block_open: Option<usize>,
@@ -38,150 +46,117 @@ struct Target {
     unterminated: bool,
 }
 
-fn target_scan(lines: &[String], pkg: &str) -> Target {
+impl Target {
+    fn singles(&self) -> impl Iterator<Item = &ThreadLoc> {
+        self.threads.values().flatten().filter(|l| l.single)
+    }
+
+    fn any_line(&self) -> bool {
+        self.pkg_line.is_some() || self.singles().next().is_some()
+    }
+
+    fn note_open(&mut self, i: usize) {
+        if self.block_close.is_none() {
+            self.block_open = Some(i);
+        }
+    }
+
+    fn note_close(&mut self, i: usize) {
+        if self.block_close.is_none() {
+            self.block_close = Some(i);
+        }
+    }
+
+    fn note_pkg_line(&mut self, line: PkgLine) {
+        self.pkg_line.get_or_insert(line);
+    }
+
+    fn note_thread(&mut self, thread: &str, loc: ThreadLoc) {
+        self.threads
+            .entry(thread.to_string())
+            .or_default()
+            .push(loc);
+    }
+}
+
+fn target_scan<S: AsRef<str>>(lines: &[S], pkg: &str) -> Target {
+    let parsed = scan(lines);
     let mut t = Target {
         pkg_line: None,
         block_open: None,
         block_close: None,
         threads: HashMap::new(),
-        unterminated: false,
+        unterminated: parsed.unterminated,
     };
-    let mut pending: Option<usize> = None;
-    let mut in_block = false;
-    let mut target_block = false;
-
-    let block_close = |t: &mut Target, target_block: &mut bool, i: usize| {
-        if *target_block && t.block_close.is_none() {
-            t.block_close = Some(i);
-        }
-        *target_block = false;
-    };
-    let block_open = |t: &mut Target, i: usize| {
-        if t.block_close.is_none() {
-            t.block_open = Some(i);
-        }
-    };
-
-    for (i, raw) in lines.iter().enumerate() {
-        let p = raw.trim();
-        if p.is_empty() || p.starts_with('#') || p.starts_with("//") {
-            continue;
-        }
-
-        if in_block {
-            if close_like(p) {
-                in_block = false;
-                block_close(&mut t, &mut target_block, i);
-                continue;
-            }
-            match split_rule_line(p) {
-                Some((name, _, closed)) => {
-                    if target_block && !name.is_empty() {
-                        t.threads.entry(name.to_string()).or_default().push(ThreadLoc {
-                            idx: i,
-                            single: false,
-                            closed,
-                            open: false,
-                        });
-                    }
-                    if closed {
-                        in_block = false;
-                        block_close(&mut t, &mut target_block, i);
-                    }
-                }
-                None => {
-                    if p.contains('}') {
-                        in_block = false;
-                        block_close(&mut t, &mut target_block, i);
-                    }
-                }
-            }
-            continue;
-        }
-
-        match parse_outer(p) {
-            OuterLine::Single { pkg: pg, thread: th, open, .. } => {
-                pending = None;
-                if pg == pkg && !th.is_empty() {
-                    t.threads.entry(th.to_string()).or_default().push(ThreadLoc {
+    for &(i, ref node) in &parsed.nodes {
+        match *node {
+            Node::Single {
+                pkg: p,
+                thread,
+                open,
+                ..
+            } if p == pkg => {
+                t.note_thread(
+                    thread,
+                    ThreadLoc {
                         idx: i,
                         single: true,
                         closed: false,
                         open,
-                    });
-                }
+                    },
+                );
                 if open {
-                    in_block = true;
-                    if pg == pkg {
-                        target_block = true;
-                        block_open(&mut t, i);
-                    }
+                    t.note_open(i);
                 }
             }
-            OuterLine::Rule { pkg: pg, open, .. } => {
+            Node::Pkg { pkg: p, open, .. } if p == pkg => {
                 if open {
-                    in_block = true;
-                    pending = None;
-                    if pg == pkg {
-                        target_block = true;
-                        block_open(&mut t, i);
-                        if t.pkg_line.is_none() {
-                            t.pkg_line = Some(PkgLine::OpenInline(i));
-                        }
-                    }
+                    t.note_open(i);
+                    t.note_pkg_line(PkgLine::OpenInline(i));
                 } else {
-                    pending = None;
-                    if pg == pkg && t.pkg_line.is_none() {
-                        t.pkg_line = Some(PkgLine::Standalone(i));
-                    }
+                    t.note_pkg_line(PkgLine::Standalone(i));
                 }
             }
-            OuterLine::BareOpen { pkg: owner } => {
-                if !owner.is_empty() {
-                    pending = None;
-                    in_block = true;
-                    if owner == pkg {
-                        target_block = true;
-                        block_open(&mut t, i);
-                        if t.pkg_line.is_none() {
-                            t.pkg_line = Some(PkgLine::BareOpen(i));
-                        }
-                    }
-                } else if let Some(pi) = pending.take() {
-                    in_block = true;
-                    if let OuterLine::Pending { pkg: pp } = parse_outer(lines[pi].trim())
-                        && pp == pkg
-                    {
-                        target_block = true;
-                        block_open(&mut t, i);
-                        if t.pkg_line.is_none() {
-                            t.pkg_line = Some(PkgLine::BarePending(pi));
-                        }
-                    }
+            Node::BareOpen { pkg: p, pending } if p == pkg => {
+                t.note_open(i);
+                t.note_pkg_line(match pending {
+                    Some(pi) => PkgLine::BarePending(pi),
+                    None => PkgLine::BareOpen(i),
+                });
+            }
+            Node::Member {
+                pkg: p,
+                thread,
+                closed,
+                ..
+            } if p == pkg => {
+                t.note_thread(
+                    thread,
+                    ThreadLoc {
+                        idx: i,
+                        single: false,
+                        closed,
+                        open: false,
+                    },
+                );
+                if closed {
+                    t.note_close(i);
                 }
             }
-            OuterLine::Pending { .. } => {
-                pending = Some(i);
+            Node::Close { pkg: p }
+            | Node::BadMember {
+                pkg: p,
+                closes: true,
+            } if p == pkg => {
+                t.note_close(i);
             }
-            OuterLine::Junk => {
-                pending = None;
-            }
+            _ => {}
         }
     }
-
-    t.unterminated = in_block;
     t
 }
 
-impl Target {
-    fn singles(&self) -> impl Iterator<Item = &ThreadLoc> {
-        self.threads.values().flatten().filter(|l| l.single)
-    }
-    fn any_line(&self) -> bool {
-        self.pkg_line.is_some() || self.singles().next().is_some()
-    }
-}
-
+/// 把 pkg 的单行线程规则并入其块：块内已有则追加到块尾，否则把包级行扩成块或新开一个块
 fn normalize_singles(lines: &mut Vec<String>, pkg: &str) {
     let t = target_scan(lines, pkg);
     let mut items: Vec<(ThreadLoc, String)> = Vec::new();
@@ -190,7 +165,7 @@ fn normalize_singles(lines: &mut Vec<String>, pkg: &str) {
         let raw = strip_comment(raw_line);
         let body = raw.strip_suffix('{').map(str::trim_end).unwrap_or(raw);
         if let Some((_, th, cp)) = split_single_line(body) {
-            let line = with_comment(&format!("\t{}={}", th, cp), raw_line);
+            let line = with_comment(&format!("\t{th}={cp}"), raw_line);
             items.push((*loc, line));
         }
     }
@@ -199,7 +174,8 @@ fn normalize_singles(lines: &mut Vec<String>, pkg: &str) {
     }
     items.sort_unstable_by_key(|(l, _)| l.idx);
     if t.block_close.is_none()
-        && (items.iter().any(|(l, _)| l.open) || !matches!(t.pkg_line, None | Some(PkgLine::Standalone(_))))
+        && (items.iter().any(|(l, _)| l.open)
+            || !matches!(t.pkg_line, None | Some(PkgLine::Standalone(_))))
     {
         return;
     }
@@ -233,7 +209,11 @@ fn normalize_singles(lines: &mut Vec<String>, pkg: &str) {
 }
 
 fn bare_open_line(pkg: &str) -> String {
-    if pkg.contains('=') { format!("{pkg}= {{") } else { format!("{pkg} {{") }
+    if pkg.contains('=') {
+        format!("{pkg}= {{")
+    } else {
+        format!("{pkg} {{")
+    }
 }
 
 fn with_comment(new_line: &str, old: &str) -> String {
@@ -243,9 +223,12 @@ fn with_comment(new_line: &str, old: &str) -> String {
     }
 }
 
+/// 替换行内 `=` 之后的 cpus，保留其后的 `{` `}` 与注释
 fn spec_swap(raw: &str, cpus: &str) -> String {
     let cut = comment_at(raw).unwrap_or(raw.len());
-    let Some(eq) = raw[..cut].rfind('=') else { return raw.into() };
+    let Some(eq) = raw[..cut].rfind('=') else {
+        return raw.into();
+    };
     let rhs = &raw[eq + 1..cut];
     let val = rhs.trim_start();
     let lead = rhs.len() - val.len();
@@ -259,6 +242,7 @@ fn spec_swap(raw: &str, cpus: &str) -> String {
     format!("{}{}{}{}", &raw[..eq + 1 + lead], cpus, tail, &raw[cut..])
 }
 
+/// 删除一条线程规则所在行；该行兼具块开/闭作用时只降级为裸 `pkg {` / `}`
 fn line_remove(lines: &mut Vec<String>, pkg: &str, loc: &ThreadLoc) {
     if loc.open {
         lines[loc.idx] = with_comment(&bare_open_line(pkg), &lines[loc.idx]);
@@ -269,136 +253,114 @@ fn line_remove(lines: &mut Vec<String>, pkg: &str, loc: &ThreadLoc) {
     }
 }
 
-fn file_write(path: &str, lines: &[String]) -> RuleEdit {
-    let mut out = lines.join("\n");
-    out.push('\n');
-    let tmp = format!("{}.tmp", path);
-    let res = fs::File::create(&tmp)
-        .and_then(|mut f| {
-            f.write_all(out.as_bytes())?;
-            f.sync_all()
-        })
-        .and_then(|_| fs::rename(&tmp, path));
-    if res.is_ok() {
-        RuleEdit::Ok
-    } else {
-        RuleEdit::IoErr
-    }
-}
-
-pub fn rule_upsert(path: &str, pkg: &str, thread: &str, cpus: &str) -> RuleEdit {
-    let _guard = crate::lock_ignore_poison(&WRITE_LOCK);
-    let mut lines: Vec<String> = fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .map(String::from)
-        .collect();
-    normalize_singles(&mut lines, pkg);
-    let t = target_scan(&lines, pkg);
+/// 设置 pkg 的包级规则（thread 为空）或线程规则
+pub fn upsert(
+    lines: &mut Vec<String>,
+    pkg: &str,
+    thread: &str,
+    cpus: &str,
+) -> Result<(), EditError> {
+    normalize_singles(lines, pkg);
+    let t = target_scan(lines, pkg);
 
     if thread.is_empty() {
         match t.pkg_line {
-            Some(PkgLine::Standalone(i)) => {
+            Some(PkgLine::Standalone(i) | PkgLine::OpenInline(i)) => {
                 lines[i] = spec_swap(&lines[i], cpus);
             }
             Some(PkgLine::BarePending(i)) => {
-                lines[i] = with_comment(&format!("{}={} {{", pkg, cpus), &lines[i]);
+                lines[i] = with_comment(&format!("{pkg}={cpus} {{"), &lines[i]);
                 if let Some(open) = t.block_open
-                    && matches!(parse_outer(lines[open].trim()), OuterLine::BareOpen { pkg: "" })
+                    && matches!(
+                        parse_outer(lines[open].trim()),
+                        OuterLine::BareOpen { pkg: "" }
+                    )
                 {
                     lines.remove(open);
                 }
             }
-            Some(PkgLine::OpenInline(i)) => {
-                lines[i] = spec_swap(&lines[i], cpus);
-            }
             Some(PkgLine::BareOpen(i)) => {
-                lines[i] = with_comment(&format!("{}={} {{", pkg, cpus), &lines[i]);
+                lines[i] = with_comment(&format!("{pkg}={cpus} {{"), &lines[i]);
             }
-            None if t.unterminated => return RuleEdit::Malformed,
-            None => lines.push(format!("{}={}", pkg, cpus)),
+            None if t.unterminated => return Err(EditError::Malformed),
+            None => lines.push(format!("{pkg}={cpus}")),
         }
     } else if let Some(locs) = t.threads.get(thread) {
-        let last = locs.last().copied().unwrap();
+        let last = locs.last().copied().expect("线程位置表不含空项");
         lines[last.idx] = spec_swap(&lines[last.idx], cpus);
         for loc in locs[..locs.len() - 1].iter().rev() {
-            line_remove(&mut lines, pkg, loc);
+            line_remove(lines, pkg, loc);
         }
     } else if let Some(close) = t.block_close {
-        lines.insert(close, format!("\t{}={}", thread, cpus));
+        lines.insert(close, format!("\t{thread}={cpus}"));
     } else if let Some(PkgLine::Standalone(i)) = t.pkg_line {
         lines[i] = format!("{} {{", lines[i].trim_end());
-        lines.splice(i + 1..i + 1, [format!("\t{}={}", thread, cpus), "}".to_string()]);
+        lines.splice(
+            i + 1..i + 1,
+            [format!("\t{thread}={cpus}"), "}".to_string()],
+        );
     } else if t.unterminated {
-        return RuleEdit::Malformed;
+        return Err(EditError::Malformed);
     } else {
         lines.push(bare_open_line(pkg));
-        lines.push(format!("\t{}={}", thread, cpus));
+        lines.push(format!("\t{thread}={cpus}"));
         lines.push("}".to_string());
     }
-
-    file_write(path, &lines)
+    Ok(())
 }
 
-pub fn rule_delete(path: &str, pkg: &str, thread: &str) -> RuleEdit {
-    let _guard = crate::lock_ignore_poison(&WRITE_LOCK);
-    let mut lines: Vec<String> = fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .map(String::from)
-        .collect();
-    normalize_singles(&mut lines, pkg);
-    let t = target_scan(&lines, pkg);
+/// 删除包级规则（thread 为空）或指定线程规则
+pub fn delete(lines: &mut Vec<String>, pkg: &str, thread: &str) -> Result<(), EditError> {
+    normalize_singles(lines, pkg);
+    let t = target_scan(lines, pkg);
 
     if thread.is_empty() {
         match t.pkg_line {
             Some(PkgLine::Standalone(i)) => {
                 lines.remove(i);
             }
-            Some(PkgLine::OpenInline(i)) => {
-                lines[i] = bare_open_line(pkg);
-            }
-            _ => return RuleEdit::NotFound,
+            Some(PkgLine::OpenInline(i)) => lines[i] = bare_open_line(pkg),
+            _ => return Err(EditError::NotFound),
         }
     } else if let Some(locs) = t.threads.get(thread) {
         for loc in locs.iter().rev() {
-            line_remove(&mut lines, pkg, loc);
+            line_remove(lines, pkg, loc);
         }
     } else {
-        return RuleEdit::NotFound;
+        return Err(EditError::NotFound);
     }
-
-    file_write(path, &lines)
+    Ok(())
 }
 
-pub fn rule_delete_pkg(path: &str, pkg: &str) -> RuleEdit {
-    let _guard = crate::lock_ignore_poison(&WRITE_LOCK);
-    let mut lines: Vec<String> = fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .map(String::from)
-        .collect();
-    normalize_singles(&mut lines, pkg);
+/// 删除 pkg 的全部规则及其块
+pub fn delete_pkg(lines: &mut Vec<String>, pkg: &str) -> Result<(), EditError> {
+    normalize_singles(lines, pkg);
 
     let mut removed = false;
     loop {
-        let t = target_scan(&lines, pkg);
+        let t = target_scan(lines, pkg);
         let mut del: Vec<usize> = Vec::new();
         match t.pkg_line {
-            Some(PkgLine::Standalone(i))
-            | Some(PkgLine::OpenInline(i))
-            | Some(PkgLine::BareOpen(i))
-            | Some(PkgLine::BarePending(i)) => del.push(i),
-            None => {
-                if !t.any_line() {
-                    break;
-                }
-            }
+            Some(
+                PkgLine::Standalone(i)
+                | PkgLine::OpenInline(i)
+                | PkgLine::BareOpen(i)
+                | PkgLine::BarePending(i),
+            ) => del.push(i),
+            None if !t.any_line() => break,
+            None => {}
         }
         if let Some(open) = t.block_open {
             let end = t
                 .block_close
-                .or_else(|| t.threads.values().flatten().filter(|l| !l.single).map(|l| l.idx).max())
+                .or_else(|| {
+                    t.threads
+                        .values()
+                        .flatten()
+                        .filter(|l| !l.single)
+                        .map(|l| l.idx)
+                        .max()
+                })
                 .unwrap_or(open);
             del.extend(open..=end);
         }
@@ -412,29 +374,25 @@ pub fn rule_delete_pkg(path: &str, pkg: &str) -> RuleEdit {
         removed = true;
     }
 
-    if !removed {
-        return RuleEdit::NotFound;
+    if removed {
+        Ok(())
+    } else {
+        Err(EditError::NotFound)
     }
-    file_write(path, &lines)
 }
 
-pub fn rule_rename(path: &str, old: &str, new: &str) -> RuleEdit {
-    let _guard = crate::lock_ignore_poison(&WRITE_LOCK);
-    let mut lines: Vec<String> = fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .map(String::from)
-        .collect();
-    normalize_singles(&mut lines, old);
-    if !target_scan(&lines, old).any_line() {
-        return RuleEdit::NotFound;
+/// 把 old 的全部规则行改名为 new
+pub fn rename(lines: &mut Vec<String>, old: &str, new: &str) -> Result<(), EditError> {
+    normalize_singles(lines, old);
+    if !target_scan(lines, old).any_line() {
+        return Err(EditError::NotFound);
     }
-    if target_scan(&lines, new).any_line() {
-        return RuleEdit::Conflict;
+    if target_scan(lines, new).any_line() {
+        return Err(EditError::Conflict);
     }
 
     loop {
-        let t = target_scan(&lines, old);
+        let t = target_scan(lines, old);
         let mut idxs: Vec<usize> = t.singles().map(|l| l.idx).collect();
         if let Some(
             PkgLine::Standalone(i)
@@ -446,18 +404,131 @@ pub fn rule_rename(path: &str, old: &str, new: &str) -> RuleEdit {
             idxs.push(i);
         }
         if idxs.is_empty() {
-            break;
+            return Ok(());
         }
         for i in idxs {
-            if let Some(rest) = lines[i].trim().strip_prefix(old) {
-                let tail = match (new.contains('='), rest.trim()) {
-                    (true, "" | "=") => "=",
-                    (true, "{") => "= {",
-                    _ => rest,
-                };
-                lines[i] = format!("{}{}", new, tail);
-            }
+            let line = lines[i].trim();
+            let rest = line.strip_prefix(old).expect("规则行以包名开头");
+            let tail = match (new.contains('='), rest.trim()) {
+                (true, "" | "=") => "=",
+                (true, "{") => "= {",
+                _ => rest,
+            };
+            lines[i] = format!("{new}{tail}");
         }
     }
-    file_write(path, &lines)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lines(text: &str) -> Vec<String> {
+        text.lines().map(String::from).collect()
+    }
+
+    fn text(lines: &[String]) -> String {
+        lines.join("\n")
+    }
+
+    fn edit(src: &str, f: impl FnOnce(&mut Vec<String>) -> Result<(), EditError>) -> String {
+        let mut l = lines(src);
+        f(&mut l).unwrap();
+        text(&l)
+    }
+
+    #[test]
+    fn upsert_package_rule() {
+        assert_eq!(edit("", |l| upsert(l, "a", "", "0-3")), "a=0-3");
+        assert_eq!(
+            edit("a=0 # keep\nb=1", |l| upsert(l, "a", "", "e-core")),
+            "a=e-core # keep\nb=1"
+        );
+        assert_eq!(
+            edit("a=0 {\n t=1\n}", |l| upsert(l, "a", "", "2")),
+            "a=2 {\n t=1\n}"
+        );
+        assert_eq!(
+            edit("a {\n t=1\n}", |l| upsert(l, "a", "", "2")),
+            "a=2 {\n t=1\n}"
+        );
+    }
+
+    #[test]
+    fn upsert_thread_rule() {
+        assert_eq!(edit("a=0", |l| upsert(l, "a", "T", "1")), "a=0 {\n\tT=1\n}");
+        assert_eq!(
+            edit("a=0 {\n X=2\n}", |l| upsert(l, "a", "T", "1")),
+            "a=0 {\n X=2\n\tT=1\n}"
+        );
+        assert_eq!(
+            edit("a=0 {\n T=2 # c\n}", |l| upsert(l, "a", "T", "1")),
+            "a=0 {\n T=1 # c\n}"
+        );
+        assert_eq!(
+            edit("x=0", |l| upsert(l, "a", "T", "1")),
+            "x=0\na {\n\tT=1\n}"
+        );
+    }
+
+    #[test]
+    fn single_line_rules_fold_into_block() {
+        assert_eq!(
+            edit("a{T}=1\na=0", |l| upsert(l, "a", "U", "2")),
+            "a=0 {\n\tT=1\n\tU=2\n}"
+        );
+        assert_eq!(
+            edit("a{T}=1", |l| upsert(l, "a", "T", "3")),
+            "a {\n\tT=3\n}"
+        );
+    }
+
+    #[test]
+    fn unterminated_block_is_reported() {
+        let mut l = lines("x {\n T=1\n");
+        assert_eq!(upsert(&mut l, "a", "", "0"), Err(EditError::Malformed));
+        let mut l = lines("a {\n T=1\n");
+        assert_eq!(upsert(&mut l, "a", "U", "2"), Err(EditError::Malformed));
+        // 已存在的线程规则无需定位块尾，可直接更新
+        assert!(upsert(&mut l, "a", "T", "2").is_ok());
+    }
+
+    #[test]
+    fn delete_rules() {
+        assert_eq!(edit("a=0\nb=1", |l| delete(l, "a", "")), "b=1");
+        assert_eq!(
+            edit("a=0 {\n T=1\n}", |l| delete(l, "a", "")),
+            "a {\n T=1\n}"
+        );
+        assert_eq!(
+            edit("a {\n T=1\n U=2\n}", |l| delete(l, "a", "T")),
+            "a {\n U=2\n}"
+        );
+        let mut l = lines("a=0");
+        assert_eq!(delete(&mut l, "a", "T"), Err(EditError::NotFound));
+        assert_eq!(delete(&mut l, "b", ""), Err(EditError::NotFound));
+    }
+
+    #[test]
+    fn delete_whole_package() {
+        assert_eq!(edit("a=0 {\n T=1\n}\nb=2", |l| delete_pkg(l, "a")), "b=2");
+        assert_eq!(edit("a=0\nb=1\na{T}=2", |l| delete_pkg(l, "a")), "b=1");
+        let mut l = lines("b=1");
+        assert_eq!(delete_pkg(&mut l, "a"), Err(EditError::NotFound));
+    }
+
+    #[test]
+    fn rename_package() {
+        assert_eq!(
+            edit("a=0 {\n T=1\n}", |l| rename(l, "a", "z")),
+            "z=0 {\n T=1\n}"
+        );
+        assert_eq!(
+            edit("a=0\na{T}=1", |l| rename(l, "a", "z")),
+            "z=0 {\n\tT=1\n}"
+        );
+        let mut l = lines("a=0\nz=1");
+        assert_eq!(rename(&mut l, "a", "z"), Err(EditError::Conflict));
+        assert_eq!(rename(&mut l, "q", "w"), Err(EditError::NotFound));
+    }
 }

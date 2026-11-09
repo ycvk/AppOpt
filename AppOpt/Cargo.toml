@@ -2,6 +2,11 @@
 name = "AppOpt"
 version = "2.2.6"
 edition = "2024"
+rust-version = "1.98"
+
+[lib]
+name = "appopt"
+path = "src/lib.rs"
 
 [[bin]]
 name = "AppOpt"
@@ -9,9 +14,11 @@ path = "src/main.rs"
 
 [dependencies]
 libc = "0.2"
-
-aya = "0.14"
 serde_json = "1"
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+aya = "0.16"
+appopt-common = { path = "../AppOpt-common", features = ["user"] }
 
 [profile.release]
 opt-level = "z"

@@ -1,0 +1,12 @@
+[package]
+name = "appopt-common"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+
+[features]
+# 用户态启用后为共享结构实现 aya::Pod
+user = ["dep:aya"]
+
+[dependencies]
+aya = { version = "0.16", optional = true }

@@ -1,6 +1,6 @@
 [package]
 name = "AppOpt-ebpf"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 
 [[bin]]
@@ -8,10 +8,12 @@ name = "AppOpt-ebpf"
 path = "src/main.rs"
 
 [dependencies]
-aya-ebpf = "0.2"
+aya-ebpf = "0.3"
+appopt-common = { path = "../AppOpt-common" }
 
 [profile.release]
 opt-level = "s"
 lto = true
 debug = false
 codegen-units = 1
+panic = "abort"

@@ -1,133 +1,181 @@
-use std::ffi::CString;
-use std::fmt::Write as _;
+//! CPU 集合、核心分层拓扑与 cpuset 目录管理
+
+use std::collections::{BTreeMap, HashSet};
+use std::fmt;
 use std::fs;
 use std::io;
-
-use std::sync::RwLock;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const CPU_SETSIZE: usize = 1024;
-pub const CPU_WORD_BITS: usize = 64;
-pub const CPU_WORDS: usize = CPU_SETSIZE / CPU_WORD_BITS;
+const WORD_BITS: usize = u64::BITS as usize;
+const WORDS: usize = CPU_SETSIZE / WORD_BITS;
 
-/// BASE_CPUSET 运行时路径，web 端可热更新，未设置时默认 /dev/cpuset/AppOpt
-static BASE_CPUSET_PATH: RwLock<Option<String>> = RwLock::new(None);
+pub const SYS_PRESENT: &str = "/sys/devices/system/cpu/present";
+pub const SYS_CPUFREQ: &str = "/sys/devices/system/cpu/cpufreq";
+pub const CPUSET_ROOT: &str = "/dev/cpuset";
 
-pub const DEFAULT_CPUSET_NAME: &str = "AppOpt";
-
-/// 设置 BASE_CPUSET 目录名，name 为空或含 / 时忽略
-pub fn set_base_cpuset(name: &str) {
-    if name.is_empty() || name.contains('/') {
-        return;
-    }
-    *BASE_CPUSET_PATH.write().unwrap() = Some(format!("/dev/cpuset/{}", name));
-}
-
-pub fn base_cpuset() -> String {
-    BASE_CPUSET_PATH
-        .read()
-        .unwrap()
-        .clone()
-        .unwrap_or_else(|| "/dev/cpuset/AppOpt".to_string())
-}
-
-const _: () = assert!(std::mem::size_of::<CpuSet>() == std::mem::size_of::<libc::cpu_set_t>());
-
+/// 与内核 cpu_set_t 布局一致的位图，下标即 CPU 编号
 #[repr(C)]
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct CpuSet {
-    pub bits: [u64; CPU_WORDS],
+    bits: [u64; WORDS],
 }
 
-impl std::fmt::Debug for CpuSet {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "CpuSet({})", self.to_range_string())
-    }
-}
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const _: () = {
+    assert!(std::mem::size_of::<CpuSet>() == std::mem::size_of::<libc::cpu_set_t>());
+    assert!(cfg!(target_endian = "little"));
+};
 
 impl CpuSet {
-    pub fn new() -> Self {
-        CpuSet::default()
+    pub fn insert(&mut self, cpu: usize) {
+        self.bits[cpu / WORD_BITS] |= 1 << (cpu % WORD_BITS);
     }
 
-    pub fn set(&mut self, cpu: usize) {
-        if cpu < CPU_SETSIZE {
-            self.bits[cpu / CPU_WORD_BITS] |= 1u64 << (cpu % CPU_WORD_BITS);
+    pub fn contains(&self, cpu: usize) -> bool {
+        cpu < CPU_SETSIZE && self.bits[cpu / WORD_BITS] & (1 << (cpu % WORD_BITS)) != 0
+    }
+
+    pub fn len(&self) -> usize {
+        self.bits.iter().map(|w| w.count_ones() as usize).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bits.iter().all(|&w| w == 0)
+    }
+
+    pub fn union(mut self, other: &CpuSet) -> CpuSet {
+        for (a, b) in self.bits.iter_mut().zip(&other.bits) {
+            *a |= b;
+        }
+        self
+    }
+
+    pub fn intersection(mut self, other: &CpuSet) -> CpuSet {
+        for (a, b) in self.bits.iter_mut().zip(&other.bits) {
+            *a &= b;
+        }
+        self
+    }
+
+    /// 按编号升序遍历
+    pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.bits.iter().enumerate().flat_map(|(w, &word)| {
+            let mut rest = word;
+            std::iter::from_fn(move || {
+                (rest != 0).then(|| {
+                    let bit = rest.trailing_zeros() as usize;
+                    rest &= rest - 1;
+                    w * WORD_BITS + bit
+                })
+            })
+        })
+    }
+
+    /// 加入 lo..=hi，超出 CPU_SETSIZE 的部分忽略
+    pub fn insert_range(&mut self, lo: usize, hi: usize) {
+        for cpu in lo..=hi.min(CPU_SETSIZE - 1) {
+            self.insert(cpu);
         }
     }
 
-    pub fn is_set(&self, cpu: usize) -> bool {
-        cpu < CPU_SETSIZE && self.bits[cpu / CPU_WORD_BITS] & (1u64 << (cpu % CPU_WORD_BITS)) != 0
+    /// 解析内核风格列表 `0-3,6`，空串得到空集合
+    pub fn parse_list(s: &str) -> Result<CpuSet, SpecError> {
+        let mut set = CpuSet::default();
+        for tok in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+            let (lo, hi) = parse_range(tok).ok_or_else(|| SpecError::Token(tok.to_string()))?;
+            set.insert_range(lo, hi);
+        }
+        Ok(set)
     }
+}
 
-    pub fn count(&self) -> usize {
-        self.bits.iter().map(|&b| b.count_ones() as usize).sum()
-    }
-
-    pub fn or(&mut self, other: &CpuSet) {
-        for (d, &s) in self.bits.iter_mut().zip(other.bits.iter()) {
-            *d |= s;
+/// `3` 或 `2-5`，反向范围按升序处理
+fn parse_range(tok: &str) -> Option<(usize, usize)> {
+    let num = |s: &str| {
+        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse::<usize>().ok())
+            .flatten()
+    };
+    match tok.split_once('-') {
+        None => num(tok).map(|n| (n, n)),
+        Some((a, b)) => {
+            let (a, b) = (num(a)?, num(b)?);
+            Some((a.min(b), a.max(b)))
         }
     }
+}
 
-    pub fn to_range_string(self) -> String {
-        let mut result = String::new();
-        let mut start: Option<usize> = None;
-        let mut end: Option<usize> = None;
+/// 输出 `0-3,6-7` 形式
+impl fmt::Display for CpuSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut cpus = self.iter().peekable();
         let mut first = true;
-
-        for (word_idx, &word) in self.bits.iter().enumerate() {
-            if word == 0 {
-                if start.is_some() {
-                    push_range(&mut result, start, end, &mut first);
-                    start = None;
-                    end = None;
-                }
-                continue;
+        while let Some(lo) = cpus.next() {
+            let mut hi = lo;
+            while cpus.next_if_eq(&(hi + 1)).is_some() {
+                hi += 1;
             }
-            let base = word_idx * CPU_WORD_BITS;
-            for bit in 0..CPU_WORD_BITS {
-                if word & (1u64 << bit) != 0 {
-                    let cpu = base + bit;
-                    if start.is_none() {
-                        start = Some(cpu);
-                        end = Some(cpu);
-                    } else if end.is_some_and(|e| cpu == e + 1) {
-                        end = Some(cpu);
-                    } else {
-                        push_range(&mut result, start, end, &mut first);
-                        start = Some(cpu);
-                        end = Some(cpu);
-                    }
-                }
+            if !first {
+                f.write_str(",")?;
+            }
+            first = false;
+            if lo == hi {
+                write!(f, "{lo}")?;
+            } else {
+                write!(f, "{lo}-{hi}")?;
             }
         }
-        push_range(&mut result, start, end, &mut first);
-        result
+        Ok(())
     }
+}
 
-    pub fn get_affinity(tid: i32) -> Option<CpuSet> {
-        let mut curr = CpuSet::new();
+impl fmt::Debug for CpuSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CpuSet({self})")
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SpecError {
+    Empty,
+    Token(String),
+    /// 语法合法但与本机在线核心无交集
+    NoCpu,
+}
+
+impl fmt::Display for SpecError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SpecError::Empty => f.write_str("CPU 规格为空"),
+            SpecError::Token(t) => write!(f, "无效的 CPU 规格: {t}"),
+            SpecError::NoCpu => f.write_str("CPU 规格与本机核心无交集"),
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl CpuSet {
+    pub fn of_thread(tid: i32) -> io::Result<CpuSet> {
+        let mut set = CpuSet::default();
+        // SAFETY: CpuSet 与 cpu_set_t 布局一致，指针与长度描述同一块缓冲区
         let ret = unsafe {
-            libc::sched_getaffinity(
-                tid,
-                std::mem::size_of::<CpuSet>(),
-                &mut curr as *mut CpuSet as *mut libc::cpu_set_t,
-            )
+            libc::sched_getaffinity(tid, size_of::<CpuSet>(), (&mut set as *mut CpuSet).cast())
         };
         if ret == -1 {
-            None
+            Err(io::Error::last_os_error())
         } else {
-            Some(curr)
+            Ok(set)
         }
     }
 
-    pub fn set_affinity(&self, tid: i32) -> io::Result<()> {
+    pub fn pin_thread(&self, tid: i32) -> io::Result<()> {
+        // SAFETY: 同 of_thread
         let ret = unsafe {
-            libc::sched_setaffinity(
-                tid,
-                std::mem::size_of::<CpuSet>(),
-                self as *const CpuSet as *const libc::cpu_set_t,
-            )
+            libc::sched_setaffinity(tid, size_of::<CpuSet>(), (self as *const CpuSet).cast())
         };
         if ret == -1 {
             Err(io::Error::last_os_error())
@@ -137,229 +185,381 @@ impl CpuSet {
     }
 }
 
-fn push_range(s: &mut String, start: Option<usize>, end: Option<usize>, first: &mut bool) {
-    if let (Some(lo), Some(hi)) = (start, end) {
-        if !*first {
-            s.push(',');
-        }
-        if lo == hi {
-            let _ = write!(s, "{}", lo);
-        } else {
-            let _ = write!(s, "{}-{}", lo, hi);
-        }
-        *first = false;
-    }
-}
-
-pub fn parse_cpu_ranges(spec: &str, present: Option<&CpuSet>) -> CpuSet {
-    let mut set = CpuSet::new();
-    if spec.is_empty() {
-        return set;
-    }
-    for part in spec.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        let (lo, hi) = if let Some(pos) = part.find('-') {
-            let a: usize = part[..pos].parse().ok().unwrap_or(usize::MAX);
-            let b: usize = part[pos + 1..].parse().ok().unwrap_or(a);
-            if a == usize::MAX {
-                continue;
-            }
-            if a > b {
-                (b, a)
-            } else {
-                (a, b)
-            }
-        } else {
-            let a: usize = part.parse().ok().unwrap_or(usize::MAX);
-            if a == usize::MAX {
-                continue;
-            }
-            (a, a)
-        };
-        for i in lo..=hi.min(CPU_SETSIZE - 1) {
-            if let Some(present) = present
-                && !present.is_set(i) {
-                    continue;
-                }
-            set.set(i);
-        }
-    }
-    set
-}
-
-/// 解析 CPU 规格，支持语义核心名(e-core/p-core/hp-core)与数字范围混合
-pub fn parse_cpu_spec(spec: &str, topo: &CpuTopology) -> CpuSet {
-    let mut set = CpuSet::new();
-    if spec.is_empty() {
-        return set;
-    }
-    for part in spec.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        // 语义名展开为对应核心层，其余按数字范围解析
-        let seg = match part {
-            "e-core" => &topo.e_core,
-            "p-core" => &topo.p_core,
-            "hp-core" => &topo.hp_core,
-            "all-core" => &topo.present_cpus,
-            _ => {
-                set.or(&parse_cpu_ranges(part, Some(&topo.present_cpus)));
-                continue;
-            }
-        };
-        set.or(seg);
-    }
-    set
-}
-
-/// 创建 cpuset 子目录并写入 cpus 与 mems
-pub(crate) fn create_cpuset_dir(path: &str, cpus: &str, mems: &str) -> bool {
-    let c_path = CString::new(path).expect("cpuset path 受控输入，无 NUL");
-    let ret = unsafe { libc::mkdir(c_path.as_ptr(), 0o755) };
-    if ret != 0 {
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::EEXIST) {
-            return false;
-        }
-    }
-    if unsafe { libc::chmod(c_path.as_ptr(), 0o755) } != 0 {
-        return false;
-    }
-    if unsafe { libc::chown(c_path.as_ptr(), 0, 0) } != 0 {
-        return false;
-    }
-    let cpus_path = format!("{}/cpus", path);
-    if fs::write(&cpus_path, cpus).is_err() {
-        return false;
-    }
-    let mems_path = format!("{}/mems", path);
-    fs::write(&mems_path, mems).is_ok()
-}
-
-/// 按合并后的 CPU 集合确保 cpuset 子目录存在，返回目录名（cpuset 未启用或创建失败返回空串）
-pub fn ensure_cpuset_dir(cpus: &CpuSet, topo: &CpuTopology) -> String {
-    if !topo.cpuset_enabled {
-        return String::new();
-    }
-    let dir_name = cpus.to_range_string();
-    let path = format!("{}/{}", base_cpuset(), dir_name);
-    // create_cpuset_dir 已处理 EEXIST，重复调用幂等
-    if create_cpuset_dir(&path, &dir_name, &topo.mems_str) {
-        dir_name
-    } else {
-        String::new()
-    }
-}
-
-#[derive(Clone)]
+/// 核心分层：按 cpufreq 策略最高频率升序，首组为 e-core，末组为 hp-core，中间各组合并为 p-core
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CpuTopology {
-    pub present_cpus: CpuSet,
-    pub present_str: String,
-    pub mems_str: String,
-    pub cpuset_enabled: bool,
+    pub present: CpuSet,
     pub e_core: CpuSet,
     pub p_core: CpuSet,
     pub hp_core: CpuSet,
 }
 
-/// 按 cpufreq 策略检测核心分层，按最高频率升序分组：首组为 e-core，末组为 hp-core，中间为 p-core
-fn detect_core_types() -> (CpuSet, CpuSet, CpuSet) {
-    let mut groups: Vec<(u64, Vec<usize>)> = Vec::new();
-    // 读取每个 policy 的 related_cpus 与 cpuinfo_max_freq，按频率合并同组
-    if let Ok(entries) = fs::read_dir("/sys/devices/system/cpu/cpufreq") {
+impl CpuTopology {
+    /// 读取 sysfs；present 不可读视为错误，缺少 cpufreq 时不分层
+    pub fn detect() -> io::Result<Self> {
+        let present = CpuSet::parse_list(fs::read_to_string(SYS_PRESENT)?.trim()).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("{SYS_PRESENT}: {e}"))
+        })?;
+        let entries = match fs::read_dir(SYS_CPUFREQ) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Ok(Self::from_groups(present, []));
+            }
+            Err(e) => return Err(e),
+        };
+        let mut groups = Vec::new();
         for entry in entries.flatten() {
-            let path = entry.path();
-            if !path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("policy"))
-            {
+            if !entry.file_name().to_string_lossy().starts_with("policy") {
                 continue;
             }
-            let freq: u64 = fs::read_to_string(path.join("cpuinfo_max_freq"))
+            let dir = entry.path();
+            let freq: u64 = fs::read_to_string(dir.join("cpuinfo_max_freq"))
                 .ok()
                 .and_then(|s| s.trim().parse().ok())
                 .unwrap_or(0);
-            if freq == 0 {
-                continue;
+            let mut cpus = CpuSet::default();
+            for cpu in fs::read_to_string(dir.join("related_cpus"))
+                .unwrap_or_default()
+                .split_whitespace()
+                .filter_map(|c| c.parse::<usize>().ok().filter(|&c| c < CPU_SETSIZE))
+            {
+                cpus.insert(cpu);
             }
-            let cpus: Vec<usize> = fs::read_to_string(path.join("related_cpus"))
-                .ok()
-                .map(|s| s.split_whitespace().filter_map(|c| c.parse().ok()).collect())
-                .unwrap_or_default();
-            if cpus.is_empty() {
-                continue;
-            }
-            if let Some(g) = groups.iter_mut().find(|(f, _)| *f == freq) {
-                g.1.extend(cpus);
-            } else {
+            if freq > 0 && !cpus.is_empty() {
                 groups.push((freq, cpus));
             }
         }
+        Ok(Self::from_groups(present, groups))
     }
-    groups.sort_by_key(|(f, _)| *f);
-    let mut e = CpuSet::new();
-    let mut p = CpuSet::new();
-    let mut h = CpuSet::new();
-    let n = groups.len();
-    for (i, (_, cpus)) in groups.iter().enumerate() {
-        let target = if i == 0 {
-            &mut e
-        } else if i == n - 1 {
-            &mut h
+
+    /// 由 (最高频率, 核心集合) 分组构造，同频率分组合并
+    pub fn from_groups(present: CpuSet, groups: impl IntoIterator<Item = (u64, CpuSet)>) -> Self {
+        let mut by_freq: BTreeMap<u64, CpuSet> = BTreeMap::new();
+        for (freq, cpus) in groups {
+            let slot = by_freq.entry(freq).or_default();
+            *slot = slot.union(&cpus);
+        }
+        let mut tiers = by_freq.into_values().collect::<Vec<_>>();
+        let hp_core = if tiers.len() >= 2 {
+            tiers.pop().unwrap()
         } else {
-            &mut p
+            CpuSet::default()
         };
-        for &cpu in cpus {
-            target.set(cpu);
+        let mut tiers = tiers.into_iter();
+        let e_core = tiers.next().unwrap_or_default();
+        let p_core = tiers.fold(CpuSet::default(), |acc, t| acc.union(&t));
+        Self {
+            present,
+            e_core,
+            p_core,
+            hp_core,
         }
     }
-    (e, p, h)
+
+    /// 解析 `e-core,0-3,7` 形式的规格：语义名与数字范围可混用，数字范围按在线核心裁剪
+    pub fn parse_spec(&self, spec: &str) -> Result<CpuSet, SpecError> {
+        let mut set = CpuSet::default();
+        let mut any = false;
+        for tok in spec.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+            any = true;
+            match tok {
+                "e-core" => set = set.union(&self.e_core),
+                "p-core" => set = set.union(&self.p_core),
+                "hp-core" => set = set.union(&self.hp_core),
+                "all-core" => set = set.union(&self.present),
+                _ => {
+                    let (lo, hi) =
+                        parse_range(tok).ok_or_else(|| SpecError::Token(tok.to_string()))?;
+                    let mut range = CpuSet::default();
+                    range.insert_range(lo, hi);
+                    set = set.union(&range.intersection(&self.present));
+                }
+            }
+        }
+        if !any {
+            Err(SpecError::Empty)
+        } else if set.is_empty() {
+            Err(SpecError::NoCpu)
+        } else {
+            Ok(set)
+        }
+    }
+
+    /// 集合对应的规格名：恰为某一分层时返回语义名，否则返回范围串
+    pub fn spec_name(&self, cpus: &CpuSet) -> String {
+        if !cpus.is_empty() {
+            for (name, tier) in [
+                ("e-core", &self.e_core),
+                ("p-core", &self.p_core),
+                ("hp-core", &self.hp_core),
+                ("all-core", &self.present),
+            ] {
+                if cpus == tier {
+                    return name.to_string();
+                }
+            }
+        }
+        cpus.to_string()
+    }
 }
 
-/// 初始化 CPU 拓扑，检测 cpuset 可用性并创建 BASE_CPUSET 目录
-pub fn init_cpu_topo() -> CpuTopology {
-    let mut topo = CpuTopology {
-        present_cpus: CpuSet::new(),
-        present_str: String::new(),
-        mems_str: String::new(),
-        cpuset_enabled: false,
-        e_core: CpuSet::new(),
-        p_core: CpuSet::new(),
-        hp_core: CpuSet::new(),
-    };
+/// `/dev/cpuset/<name>` 下的 cpuset 目录：根目录容纳全部在线核心，其余按 CPU 集合各建一个子目录
+pub struct CpusetFs {
+    root: PathBuf,
+    mems: String,
+    present: CpuSet,
+    /// 已建好的子目录
+    ready: Mutex<HashSet<CpuSet>>,
+    /// 创建失败并已告警的子目录；失败不缓存，下次使用时重试
+    warned: Mutex<HashSet<CpuSet>>,
+    move_warned: AtomicBool,
+}
 
-    if let Ok(content) = fs::read_to_string("/sys/devices/system/cpu/present") {
-        topo.present_str = content.trim().to_string();
+impl CpusetFs {
+    /// 创建 `<cpuset_root>/<name>`；cpuset_root 不存在表示系统未挂载 cpuset，返回 Ok(None)
+    pub fn open(cpuset_root: &Path, name: &str, present: &CpuSet) -> io::Result<Option<Self>> {
+        if !cpuset_root.exists() {
+            return Ok(None);
+        }
+        let mems = fs::read_to_string(cpuset_root.join("mems"))?
+            .trim()
+            .to_string();
+        if mems.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cpuset mems 为空",
+            ));
+        }
+        let this = Self {
+            root: cpuset_root.join(name),
+            mems,
+            present: *present,
+            ready: Mutex::new(HashSet::new()),
+            warned: Mutex::new(HashSet::new()),
+            move_warned: AtomicBool::new(false),
+        };
+        make_dir(&this.root, &present.to_string(), &this.mems)?;
+        Ok(Some(this))
     }
-    topo.present_cpus = parse_cpu_ranges(&topo.present_str, None);
-    let (e, p, h) = detect_core_types();
-    topo.e_core = e;
-    topo.p_core = p;
-    topo.hp_core = h;
 
-    let cpuset_path = CString::new("/dev/cpuset").expect("常量字符串无 NUL");
-    if unsafe { libc::access(cpuset_path.as_ptr(), libc::F_OK) } != 0 {
-        return topo;
+    pub fn name(&self) -> &str {
+        self.root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
     }
 
-    let mems = fs::read_to_string("/dev/cpuset/mems")
-        .ok()
-        .and_then(|s| {
-            let t = s.trim().to_string();
-            if t.is_empty() { None } else { Some(t) }
-        })
-        .unwrap_or_else(|| "0".to_string());
-    topo.mems_str = mems;
-
-    if create_cpuset_dir(&base_cpuset(), &topo.present_str, &topo.mems_str) {
-        topo.cpuset_enabled = true;
+    /// cpus 对应目录的 tasks 文件，子目录按需创建
+    pub fn tasks_path(&self, cpus: &CpuSet) -> PathBuf {
+        if *cpus == self.present {
+            return self.root.join("tasks");
+        }
+        let name = cpus.to_string();
+        let dir = self.root.join(&name);
+        let mut ready = self.ready.lock().expect("cpuset 目录表锁中毒");
+        if !ready.contains(cpus) {
+            match make_dir(&dir, &name, &self.mems) {
+                Ok(()) => {
+                    ready.insert(*cpus);
+                }
+                Err(e) => {
+                    if self
+                        .warned
+                        .lock()
+                        .expect("cpuset 告警表锁中毒")
+                        .insert(*cpus)
+                    {
+                        eprintln!(
+                            "警告: 创建 cpuset 目录 {} 失败 ({e})，暂用 {}，之后每次使用时重试",
+                            dir.display(),
+                            self.root.display()
+                        );
+                    }
+                    return self.root.join("tasks");
+                }
+            }
+        }
+        dir.join("tasks")
     }
 
-    topo
+    /// 把线程移入 cpus 对应的 cpuset，线程已退出（ESRCH）时返回 false；其余失败仅首次告警
+    fn adopt(&self, tid: i32, cpus: &CpuSet) -> bool {
+        use std::io::Write;
+        let path = self.tasks_path(cpus);
+        let res = fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| writeln!(f, "{tid}"));
+        match res {
+            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => false,
+            Err(e) => {
+                if !self.move_warned.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "警告: 写入 {} 失败 ({e})，后续同类错误不再提示",
+                        path.display()
+                    );
+                }
+                true
+            }
+            Ok(()) => true,
+        }
+    }
+}
+
+fn make_dir(path: &Path, cpus: &str, mems: &str) -> io::Result<()> {
+    match fs::create_dir(path) {
+        Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
+        _ => {}
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+    fs::write(path.join("cpus"), cpus)?;
+    fs::write(path.join("mems"), mems)
+}
+
+/// 单线程绑定结果
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub enum Bind {
+    Done,
+    /// 线程已退出
+    Gone,
+    Failed(io::Error),
+}
+
+/// 把线程绑定到 cpus：先移入对应 cpuset（若启用），再设置亲和性；已符合目标时不做任何写入
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn bind_thread(tid: i32, cpus: &CpuSet, cpusets: Option<&CpusetFs>) -> Bind {
+    if CpuSet::of_thread(tid).is_ok_and(|cur| cur == *cpus) {
+        return Bind::Done;
+    }
+    if cpusets.is_some_and(|fs| !fs.adopt(tid, cpus)) {
+        return Bind::Gone;
+    }
+    match cpus.pin_thread(tid) {
+        Ok(()) => Bind::Done,
+        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Bind::Gone,
+        Err(e) => Bind::Failed(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(spec: &str) -> CpuSet {
+        CpuSet::parse_list(spec).unwrap()
+    }
+
+    fn topo_3tier() -> CpuTopology {
+        CpuTopology::from_groups(
+            set("0-7"),
+            [
+                (1800000, set("0-3")),
+                (2400000, set("4-6")),
+                (3000000, set("7")),
+            ],
+        )
+    }
+
+    #[test]
+    fn display_groups_runs() {
+        assert_eq!(set("0,1,2,5,7-9").to_string(), "0-2,5,7-9");
+        assert_eq!(set("").to_string(), "");
+        assert_eq!(set("63,64,65").to_string(), "63-65");
+        assert_eq!(set("1023").to_string(), "1023");
+    }
+
+    #[test]
+    fn parse_list_rules() {
+        assert_eq!(set("3-1"), set("1-3"));
+        assert_eq!(set(" 0 , 2 ").to_string(), "0,2");
+        assert_eq!(set("2000").to_string(), "");
+        assert!(CpuSet::parse_list("a").is_err());
+        assert!(CpuSet::parse_list("1-").is_err());
+        assert!(CpuSet::parse_list("1-2-3").is_err());
+        assert!(CpuSet::parse_list("99999999999999999999").is_err());
+    }
+
+    #[test]
+    fn tiers_from_freq_groups() {
+        let t = topo_3tier();
+        assert_eq!(t.e_core, set("0-3"));
+        assert_eq!(t.p_core, set("4-6"));
+        assert_eq!(t.hp_core, set("7"));
+
+        let two = CpuTopology::from_groups(set("0-7"), [(1, set("0-3")), (2, set("4-7"))]);
+        assert_eq!(
+            (two.e_core, two.p_core, two.hp_core),
+            (set("0-3"), set(""), set("4-7"))
+        );
+
+        let one = CpuTopology::from_groups(set("0-3"), [(1, set("0-1")), (1, set("2-3"))]);
+        assert_eq!(
+            (one.e_core, one.p_core, one.hp_core),
+            (set("0-3"), set(""), set(""))
+        );
+
+        let none = CpuTopology::from_groups(set("0-3"), []);
+        assert!(none.e_core.is_empty() && none.hp_core.is_empty());
+    }
+
+    #[test]
+    fn spec_resolution() {
+        let t = topo_3tier();
+        assert_eq!(t.parse_spec("e-core,hp-core"), Ok(set("0-3,7")));
+        assert_eq!(t.parse_spec("all-core"), Ok(set("0-7")));
+        assert_eq!(t.parse_spec("0-1,6-20"), Ok(set("0-1,6-7")));
+        assert_eq!(t.parse_spec("5-4"), Ok(set("4-5")));
+        assert_eq!(t.parse_spec(""), Err(SpecError::Empty));
+        assert_eq!(t.parse_spec(" , "), Err(SpecError::Empty));
+        assert_eq!(t.parse_spec("8-9"), Err(SpecError::NoCpu));
+        assert_eq!(
+            t.parse_spec("x-core"),
+            Err(SpecError::Token("x-core".into()))
+        );
+        assert_eq!(t.parse_spec("0-3,abc"), Err(SpecError::Token("abc".into())));
+        // 语义名在无该分层的设备上贡献空集，整体为空时报错
+        let flat = CpuTopology::from_groups(set("0-3"), []);
+        assert_eq!(flat.parse_spec("hp-core"), Err(SpecError::NoCpu));
+        assert_eq!(flat.parse_spec("hp-core,0"), Ok(set("0")));
+    }
+
+    #[test]
+    fn spec_names() {
+        let t = topo_3tier();
+        assert_eq!(t.spec_name(&set("0-3")), "e-core");
+        assert_eq!(t.spec_name(&set("4-6")), "p-core");
+        assert_eq!(t.spec_name(&set("7")), "hp-core");
+        assert_eq!(t.spec_name(&set("0-7")), "all-core");
+        assert_eq!(t.spec_name(&set("1,3")), "1,3");
+    }
+
+    #[test]
+    fn cpuset_dirs_follow_cpu_sets() {
+        let base = std::env::temp_dir().join(format!("appopt-cpuset-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("mems"), "0\n").unwrap();
+
+        let present = set("0-7");
+        let cs = CpusetFs::open(&base, "AppOpt", &present).unwrap().unwrap();
+        assert_eq!(cs.name(), "AppOpt");
+        assert_eq!(fs::read_to_string(base.join("AppOpt/cpus")).unwrap(), "0-7");
+        assert_eq!(fs::read_to_string(base.join("AppOpt/mems")).unwrap(), "0");
+
+        assert_eq!(cs.tasks_path(&present), base.join("AppOpt/tasks"));
+        let sub = cs.tasks_path(&set("4-7"));
+        assert_eq!(sub, base.join("AppOpt/4-7/tasks"));
+        assert_eq!(
+            fs::read_to_string(base.join("AppOpt/4-7/cpus")).unwrap(),
+            "4-7"
+        );
+        assert_eq!(cs.tasks_path(&set("4-7")), sub);
+
+        assert!(
+            CpusetFs::open(&base.join("absent"), "x", &present)
+                .unwrap()
+                .is_none()
+        );
+        fs::remove_dir_all(&base).unwrap();
+    }
 }

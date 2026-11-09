@@ -1,66 +1,65 @@
+//! 本机 HTTP 管理面板：静态页面 + JSON 接口，仅监听 127.0.0.1
+
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::Mutex;
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::apply_affinity::{read_cmdline, task_tids};
-use crate::cache::ProcCache;
-use crate::config::{
-    config_reload_now, spec_like,
-    CHECK_INTERVAL, CONFIG_FILE, CURRENT_CONFIG, FORCE_RELOAD, PARSE_FAILS,
-};
-use crate::cpuset::{base_cpuset, create_cpuset_dir, parse_cpu_spec, CpuSet, CpuTopology, DEFAULT_CPUSET_NAME};
-use crate::ebpf_mode::ebpf_probe;
-use crate::rule_edit::{rule_delete, rule_delete_pkg, rule_rename, rule_upsert, RuleEdit};
-use crate::{lock_ignore_poison, EBPF_GAVE_UP, MAX_PKG_LEN, MAX_THREAD_LEN};
+use crate::config::{MAX_PKG_LEN, MAX_THREAD_LEN};
+use crate::rule_edit::{self, EditError};
+use crate::settings::{INTERVAL_RANGE, Mode, valid_cpuset_name, valid_path};
+use crate::shared::{ConfigPatch, RuleEditError, Shared};
+use crate::{ebpf_mode, procfs};
 
-pub const WEB_PORT: u16 = 8889;
-const INDEX_HTML: &str = include_str!("../web/index.html");
+pub const PORT: u16 = 8889;
+const INDEX_HTML: &str = include_str!("../../web/index.html");
 
-pub static MODE_FORCE: AtomicU8 = AtomicU8::new(0);
-pub static WEB_ENABLED: AtomicBool = AtomicBool::new(false);
+const MAX_HEAD: usize = 8192;
+const MAX_BODY: usize = 16384;
+const MAX_CONNECTIONS: usize = 16;
+const SUGGEST_LIMIT: usize = 20;
 
-pub static WEB_STATS: Mutex<Option<WebStats>> = Mutex::new(None);
-
-#[derive(Clone)]
-pub struct WebStats {
-    pub rules: usize,
-    pub pkgs: usize,
-    pub hit_pkgs: usize,
-    pub threads: usize,
-    pub ebpf: bool,
-    pub uptime: u64,
+/// 在 127.0.0.1:PORT 启动服务线程
+pub fn start(shared: Arc<Shared>) -> io::Result<()> {
+    let listener = TcpListener::bind(("127.0.0.1", PORT))?;
+    shared.set_web_running();
+    println!("Web: 前端已启用 http://127.0.0.1:{PORT}/");
+    thread::Builder::new()
+        .name("WebAccept".into())
+        .spawn(move || {
+            let active = Arc::new(AtomicUsize::new(0));
+            for stream in listener.incoming().flatten() {
+                // 超出上限的连接直接关闭，避免本机其他应用耗尽守护进程的线程与句柄
+                if active.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
+                    active.fetch_sub(1, Ordering::AcqRel);
+                    continue;
+                }
+                let slot = Slot(active.clone());
+                let shared = shared.clone();
+                thread::spawn(move || {
+                    let _slot = slot;
+                    serve(&shared, stream);
+                });
+            }
+        })?;
+    Ok(())
 }
 
-/// 缓存统计
-pub fn cache_stats(cache: &ProcCache) -> (usize, usize) {
-    let pkgs: HashSet<&str> = cache.tasks.values().map(|e| e.pkg.as_str()).collect();
-    (cache.tasks.len(), pkgs.len())
-}
+/// 并发连接占位，释放时归还名额
+struct Slot(Arc<AtomicUsize>);
 
-/// 启动 web 前端
-pub fn web_start() {
-    let listener = match TcpListener::bind(("127.0.0.1", WEB_PORT)) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("Web: 监听 127.0.0.1:{} 失败 ({})", WEB_PORT, e);
-            return;
-        }
-    };
-    WEB_ENABLED.store(true, Ordering::Release);
-    println!("Web: 前端已启用 http://127.0.0.1:{}/", WEB_PORT);
-    thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            thread::spawn(move || conn_handle(stream));
-        }
-    });
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 struct Request {
@@ -74,73 +73,86 @@ struct Request {
     keep_alive: bool,
 }
 
-fn conn_handle(stream: TcpStream) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-    let _ = stream.set_nodelay(true);
-    let mut writer = match stream.try_clone() {
-        Ok(w) => w,
-        Err(_) => return,
-    };
-    let mut reader = BufReader::new(stream);
-    while let Some(req) = request_read(&mut reader) {
-        dispatch(&mut writer, &req);
-        if !req.keep_alive {
-            return;
-        }
-    }
+struct Response {
+    status: u16,
+    content_type: &'static str,
+    body: Vec<u8>,
 }
 
-fn request_read(reader: &mut BufReader<TcpStream>) -> Option<Request> {
-    let mut head = Vec::with_capacity(512);
-    let mut line = Vec::with_capacity(128);
-    loop {
-        line.clear();
-        reader.read_until(b'\n', &mut line).ok()?;
-        if line.is_empty() {
-            return None;
+fn serve(shared: &Shared, stream: TcpStream) {
+    // 客户端断开等连接级错误无需处理，结束该连接即可
+    let _ = (|| -> io::Result<()> {
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_nodelay(true)?;
+        let mut writer = stream.try_clone()?;
+        let mut reader = BufReader::new(stream);
+        while let Some(req) = read_request(&mut reader) {
+            send(&mut writer, &dispatch(shared, &req), req.keep_alive)?;
+            if !req.keep_alive {
+                break;
+            }
         }
+        Ok(())
+    })();
+}
+
+/// 读一行，总量受 budget 限制；超限或连接关闭返回 None
+fn read_line_limited(reader: &mut impl BufRead, budget: &mut usize) -> Option<Vec<u8>> {
+    let mut line = Vec::new();
+    let n = reader
+        .take(*budget as u64 + 1)
+        .read_until(b'\n', &mut line)
+        .ok()?;
+    if n == 0 || n > *budget {
+        return None;
+    }
+    *budget -= n;
+    Some(line)
+}
+
+fn read_request(reader: &mut impl BufRead) -> Option<Request> {
+    let mut budget = MAX_HEAD;
+    let mut head = String::new();
+    loop {
+        let line = read_line_limited(reader, &mut budget)?;
         if line == b"\r\n" || line == b"\n" {
             break;
         }
-        head.extend_from_slice(&line);
-        if head.len() > 8192 {
-            return None;
-        }
+        head.push_str(&String::from_utf8_lossy(&line));
     }
 
-    let head_str = String::from_utf8_lossy(&head);
-    let mut lines = head_str.lines();
+    let mut lines = head.lines();
     let mut parts = lines.next()?.split_whitespace();
     let method = parts.next()?.to_string();
     let path = parts.next()?.split('?').next().unwrap_or("").to_string();
-    let version = parts.next().unwrap_or("HTTP/1.1").to_string();
+    let version = parts.next().unwrap_or("HTTP/1.1");
 
-    let (mut host, mut origin, mut site, mut ctype, mut len) =
-        (String::new(), String::new(), String::new(), String::new(), 0usize);
-    let mut conn = String::new();
+    let (mut host, mut origin, mut fetch_site, mut content_type, mut conn) = Default::default();
+    let mut len = 0usize;
     for h in lines {
-        let Some((k, v)) = h.split_once(':') else { continue };
-        let v = v.trim();
+        let Some((k, v)) = h.split_once(':') else {
+            continue;
+        };
+        let v = v.trim().to_ascii_lowercase();
         match k.trim().to_ascii_lowercase().as_str() {
-            "host" => host = v.to_ascii_lowercase(),
-            "origin" => origin = v.to_ascii_lowercase(),
-            "sec-fetch-site" => site = v.to_ascii_lowercase(),
-            "content-type" => ctype = v.to_ascii_lowercase(),
+            "host" => host = v,
+            "origin" => origin = v,
+            "sec-fetch-site" => fetch_site = v,
+            "content-type" => content_type = v,
             "content-length" => len = v.parse().unwrap_or(usize::MAX),
-            "connection" => conn = v.to_ascii_lowercase(),
-            "transfer-encoding" => return None, // 拒绝 chunked
+            "connection" => conn = v,
+            // 不支持分块编码
+            "transfer-encoding" => return None,
             _ => {}
         }
     }
-    if len > 16384 {
+    if len > MAX_BODY {
         return None;
     }
 
     let mut body = vec![0u8; len];
-    if len > 0 {
-        reader.read_exact(&mut body).ok()?;
-    }
+    reader.read_exact(&mut body).ok()?;
     let keep_alive = if version == "HTTP/1.0" {
         conn.contains("keep-alive")
     } else {
@@ -151,155 +163,223 @@ fn request_read(reader: &mut BufReader<TcpStream>) -> Option<Request> {
         path,
         host,
         origin,
-        fetch_site: site,
-        content_type: ctype,
+        fetch_site,
+        content_type,
         body,
         keep_alive,
     })
 }
 
-fn resp_send(out: &mut TcpStream, status: u16, ctype: &str, body: &[u8], close: bool) {
-    let reason = match status {
+fn send(out: &mut impl Write, resp: &Response, keep_alive: bool) -> io::Result<()> {
+    let reason = match resp.status {
         200 => "OK",
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
+        409 => "Conflict",
         _ => "Error",
     };
-    let head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: {}\r\n\r\n",
-        status,
-        reason,
-        ctype,
-        body.len(),
-        if close { "close" } else { "keep-alive" }
-    );
-    let _ = out.write_all(head.as_bytes());
-    let _ = out.write_all(body);
-    let _ = out.flush();
+    write!(
+        out,
+        "HTTP/1.1 {} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: {}\r\n\r\n",
+        resp.status,
+        resp.content_type,
+        resp.body.len(),
+        if keep_alive { "keep-alive" } else { "close" }
+    )?;
+    out.write_all(&resp.body)?;
+    out.flush()
 }
 
-fn dispatch(out: &mut TcpStream, req: &Request) {
-    let port_str = format!(":{}", WEB_PORT);
-    let host = req.host.strip_suffix(&port_str).unwrap_or(req.host.as_str());
-    let origin_ok = matches!(host, "127.0.0.1" | "localhost")
+/// 仅接受本机页面发起的请求：Host 必须是回环地址，带 Origin 时须同源，POST 必须是 JSON
+fn request_allowed(req: &Request) -> bool {
+    let host = req
+        .host
+        .strip_suffix(&format!(":{PORT}"))
+        .unwrap_or(&req.host);
+    matches!(host, "127.0.0.1" | "localhost")
         && (req.origin.is_empty()
             || req.origin == "null"
             || matches!(req.fetch_site.as_str(), "" | "none" | "same-origin"))
-        && (req.method != "POST" || req.content_type.starts_with("application/json"));
-    if !origin_ok {
-        resp_send(out, 403, "application/json", b"{\"ok\":false,\"err\":\"forbidden\"}", true);
-        return;
-    }
+        && (req.method != "POST" || req.content_type.starts_with("application/json"))
+}
 
+struct ApiError(u16, String);
+
+type ApiResult = Result<Value, ApiError>;
+
+fn api_err(status: u16, msg: impl Into<String>) -> ApiError {
+    ApiError(status, msg.into())
+}
+
+fn bad_request(msg: impl Into<String>) -> ApiError {
+    api_err(400, msg)
+}
+
+fn ok() -> ApiResult {
+    Ok(json!({ "ok": true }))
+}
+
+fn json_response(status: u16, body: Value) -> Response {
+    Response {
+        status,
+        content_type: "application/json",
+        body: body.to_string().into_bytes(),
+    }
+}
+
+fn dispatch(shared: &Shared, req: &Request) -> Response {
+    if !request_allowed(req) {
+        return json_response(403, json!({ "ok": false, "err": "forbidden" }));
+    }
     if req.method == "GET" && matches!(req.path.as_str(), "/" | "/index.html") {
-        resp_send(out, 200, "text/html; charset=utf-8", INDEX_HTML.as_bytes(), !req.keep_alive);
-        return;
+        return Response {
+            status: 200,
+            content_type: "text/html; charset=utf-8",
+            body: INDEX_HTML.as_bytes().to_vec(),
+        };
     }
 
-    let (status, body) = match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/api/status") => (200, status_json()),
-        ("GET", "/api/rules") => (200, rules_json()),
-        ("GET", "/api/config") => (200, config_json()),
-        ("POST", "/api/rule") => rule_api(req),
-        ("POST", "/api/rule/del") => rule_del_api(req),
-        ("POST", "/api/rule/rename") => rule_rename_api(req),
-        ("POST", "/api/config") => config_set_api(req),
-        ("POST", "/api/suggest") => suggest_api(req),
-        _ => err_json(404, "not found"),
+    let result = match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/api/status") => status(shared),
+        ("GET", "/api/rules") => Ok(rules(shared)),
+        ("GET", "/api/config") => Ok(config(shared)),
+        ("POST", "/api/rule") => json_body(req).and_then(|v| rule_set(shared, &v)),
+        ("POST", "/api/rule/del") => json_body(req).and_then(|v| rule_del(shared, &v)),
+        ("POST", "/api/rule/rename") => json_body(req).and_then(|v| rule_rename(shared, &v)),
+        ("POST", "/api/config") => json_body(req).and_then(|v| config_set(shared, &v)),
+        ("POST", "/api/suggest") => json_body(req).and_then(|v| suggest(&v)),
+        _ => Err(api_err(404, "not found")),
     };
-    resp_send(out, status, "application/json", body.as_bytes(), !req.keep_alive);
-}
-
-fn err_json(code: u16, msg: &str) -> (u16, String) {
-    (code, json!({ "ok": false, "err": msg }).to_string())
-}
-
-fn current_cfg() -> Option<std::sync::Arc<crate::config::AppConfig>> {
-    lock_ignore_poison(&CURRENT_CONFIG).clone()
-}
-
-fn sys_procs() -> u16 {
-    let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
-    if unsafe { libc::sysinfo(&mut info) } == 0 {
-        info.procs
-    } else {
-        0
+    match result {
+        Ok(body) => json_response(200, body),
+        Err(ApiError(status, msg)) => json_response(status, json!({ "ok": false, "err": msg })),
     }
 }
 
-/// CPU 集合转语义名
-fn spec_name(cpus: &CpuSet, topo: &CpuTopology) -> String {
-    if cpus.count() > 0 {
-        if *cpus == topo.e_core {
-            return "e-core".into();
-        }
-        if *cpus == topo.p_core {
-            return "p-core".into();
-        }
-        if *cpus == topo.hp_core {
-            return "hp-core".into();
-        }
-        if *cpus == topo.present_cpus {
-            return "all-core".into();
-        }
-    }
-    cpus.to_range_string()
+fn json_body(req: &Request) -> Result<Value, ApiError> {
+    serde_json::from_slice(&req.body).map_err(|_| bad_request("请求体不是合法 JSON"))
 }
 
-fn status_json() -> String {
-    let stats = lock_ignore_poison(&WEB_STATS).clone();
-    let cfg = current_cfg();
-    let topo = cfg.as_ref().map(|c| &c.topo);
-    let s = stats.unwrap_or(WebStats {
-        rules: 0,
-        pkgs: 0,
-        hit_pkgs: 0,
-        threads: 0,
-        ebpf: false,
-        uptime: 0,
-    });
-    json!({
+fn engine_label(ebpf: bool) -> &'static str {
+    if ebpf { "ebpf" } else { "proc" }
+}
+
+fn status(shared: &Shared) -> ApiResult {
+    let (cfg, stats, settings) = (shared.config(), shared.stats(), shared.settings());
+    let topo = &cfg.topo;
+    let total_procs =
+        procfs::thread_count().map_err(|e| api_err(500, format!("sysinfo 失败: {e}")))?;
+    Ok(json!({
         "version": env!("CARGO_PKG_VERSION"),
-        "mode": if s.ebpf { "ebpf" } else { "proc" },
-        "uptime": s.uptime,
-        "rules": s.rules,
-        "pkgs": s.pkgs,
-        "parse_fail": PARSE_FAILS.load(Ordering::Relaxed),
-        "hit_pkgs": s.hit_pkgs,
-        "threads": s.threads,
-        "total_procs": sys_procs(),
-        "interval": CHECK_INTERVAL.load(Ordering::Relaxed).max(1),
-        "e_core": topo.map(|t| t.e_core.to_range_string()).unwrap_or_default(),
-        "p_core": topo.map(|t| t.p_core.to_range_string()).unwrap_or_default(),
-        "hp_core": topo.map(|t| t.hp_core.to_range_string()).unwrap_or_default(),
-        "all_core": topo.map(|t| t.present_str.clone()).unwrap_or_default(),
-        "cores": topo.map(|t| t.present_cpus.count()).unwrap_or(0),
-        "cpuset_enabled": topo.is_some_and(|t| t.cpuset_enabled),
+        "mode": engine_label(stats.ebpf),
+        "uptime": shared.started.elapsed().as_secs(),
+        "rules": cfg.rule_count(),
+        "pkgs": cfg.groups().len(),
+        "parse_fail": cfg.parse_fails,
+        "hit_pkgs": stats.hit_pkgs,
+        "threads": stats.threads,
+        "total_procs": total_procs,
+        "interval": settings.check_interval,
+        "e_core": topo.e_core.to_string(),
+        "p_core": topo.p_core.to_string(),
+        "hp_core": topo.hp_core.to_string(),
+        "all_core": topo.present.to_string(),
+        "cores": topo.present.len(),
+        "cpuset_enabled": cfg.cpusets.is_some(),
+    }))
+}
+
+fn rules(shared: &Shared) -> Value {
+    let cfg = shared.config();
+    let groups: Vec<Value> = cfg
+        .groups()
+        .iter()
+        .map(|g| {
+            let items: Vec<Value> = g
+                .items
+                .iter()
+                .map(|r| json!({ "thread": r.thread, "spec": cfg.topo.spec_name(&r.cpus) }))
+                .collect();
+            json!({ "pkg": &*g.pkg, "items": items })
+        })
+        .collect();
+    json!({ "rules": groups })
+}
+
+fn config(shared: &Shared) -> Value {
+    let (cfg, stats, settings) = (shared.config(), shared.stats(), shared.settings());
+    json!({
+        "mode": settings.mode as u8,
+        "mode_active": engine_label(stats.ebpf),
+        "ebpf_available": ebpf_mode::available(),
+        "interval": settings.check_interval,
+        "cpuset_name": settings.cpuset_name,
+        "config_file": settings.config_file,
+        "cpuset_enabled": cfg.cpusets.is_some(),
     })
-    .to_string()
 }
 
-fn rules_json() -> String {
-    let Some(cfg) = current_cfg() else {
-        return json!({ "rules": [] }).to_string();
-    };
-    let mut groups: Vec<serde_json::Value> = Vec::new();
-    let mut index: HashMap<&str, usize> = HashMap::new();
-    for r in &cfg.rules {
-        let gi = *index.entry(r.pkg.as_str()).or_insert_with(|| {
-            groups.push(json!({ "pkg": r.pkg, "items": [] }));
-            groups.len() - 1
-        });
-        groups[gi]["items"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({ "thread": r.thread, "spec": spec_name(&r.cpus, &cfg.topo) }));
+/// 字段缺省或为 null 视为未提供；提供了就必须合法
+fn opt<'a, T>(
+    v: &'a Value,
+    key: &str,
+    parse: impl FnOnce(&'a Value) -> Option<T>,
+    msg: &str,
+) -> Result<Option<T>, ApiError> {
+    match v.get(key).filter(|x| !x.is_null()) {
+        None => Ok(None),
+        Some(x) => parse(x).map(Some).ok_or_else(|| bad_request(msg)),
     }
-    json!({ "rules": groups }).to_string()
 }
 
-/// 名称校验
+fn config_set(shared: &Shared, v: &Value) -> ApiResult {
+    let mode = opt(
+        v,
+        "mode",
+        |x| x.as_u64().and_then(|n| Mode::try_from(n).ok()),
+        "无效的工作模式",
+    )?;
+    let interval = opt(
+        v,
+        "interval",
+        |x| x.as_u64().filter(|n| INTERVAL_RANGE.contains(n)),
+        "间隔需在 1-3600 秒之间",
+    )?;
+    let cpuset_name = opt(
+        v,
+        "cpuset_name",
+        |x| {
+            x.as_str()
+                .filter(|n| valid_cpuset_name(n))
+                .map(str::to_string)
+        },
+        "无效的 cpuset 目录名",
+    )?;
+    let config_file = opt(
+        v,
+        "config_file",
+        |x| x.as_str().filter(|p| config_path_ok(p)).map(str::to_string),
+        "无效的配置文件路径，文件名需以 .conf 结尾",
+    )?;
+
+    shared
+        .patch(ConfigPatch {
+            mode,
+            interval,
+            cpuset_name,
+            config_file,
+        })
+        .map_err(|e| api_err(500, format!("应用设置失败: {e}")))?;
+    ok()
+}
+
+/// 经 web 切换的规则文件必须是 .conf，避免守护进程（root）被借来改写其他类型的文件
+fn config_path_ok(p: &str) -> bool {
+    valid_path(p) && Path::new(p).extension().is_some_and(|e| e == "conf")
+}
+
+/// 名称校验：非空、长度受限、无控制字符，且不含会被当作注释的 `#` 与 `//`
 fn token_ok(s: &str, max: usize) -> bool {
     let t = s.trim();
     !t.is_empty()
@@ -309,373 +389,282 @@ fn token_ok(s: &str, max: usize) -> bool {
         && !t.contains("//")
 }
 
+/// `pkg{...}` 形态在文件里会被解析成单行线程规则，不能作为包名
 fn pkg_shape_ok(pkg: &str) -> bool {
     !(pkg.contains('{') && pkg.ends_with('}'))
 }
 
-fn rule_api(req: &Request) -> (u16, String) {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
-        return err_json(400, "请求体不是合法 JSON");
+fn edit_failure(e: RuleEditError, not_found: &str) -> ApiError {
+    match e {
+        RuleEditError::Edit(EditError::NotFound) => api_err(404, not_found),
+        RuleEditError::Edit(EditError::Conflict) => api_err(409, "目标包名已存在规则"),
+        RuleEditError::Edit(EditError::Malformed) => {
+            api_err(409, "配置文件存在未闭合块，请修复后重试")
+        }
+        RuleEditError::Io(e) => api_err(500, format!("配置文件读写失败: {e}")),
+    }
+}
+
+fn str_field<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
+    v[key].as_str().map(str::trim)
+}
+
+fn rule_set(shared: &Shared, v: &Value) -> ApiResult {
+    let (Some(pkg), Some(cpus)) = (str_field(v, "pkg"), str_field(v, "cpus")) else {
+        return Err(bad_request("缺少 pkg 或 cpus 字段"));
     };
-    let (Some(pkg), Some(cpus)) = (
-        v["pkg"].as_str().map(str::trim),
-        v["cpus"].as_str().map(str::trim),
-    ) else {
-        return err_json(400, "缺少 pkg 或 cpus 字段");
-    };
-    let thread = v["thread"].as_str().map(str::trim).unwrap_or("");
-    let Some(cfg) = current_cfg() else {
-        return err_json(500, "配置未就绪");
-    };
+    let thread = str_field(v, "thread").unwrap_or("");
     if !token_ok(pkg, MAX_PKG_LEN) || (!thread.is_empty() && !token_ok(thread, MAX_THREAD_LEN)) {
-        return err_json(400, "名称含有非法字符");
+        return Err(bad_request("名称含有非法字符"));
     }
     if thread.is_empty() && !pkg_shape_ok(pkg) {
-        return err_json(400, "包名含 { 且以 } 结尾时不支持包级规则，可改用线程规则");
+        return Err(bad_request(
+            "包名含 { 且以 } 结尾时不支持包级规则，可改用线程规则",
+        ));
     }
-    if cpus.is_empty() || cpus.len() >= 64 || !spec_like(cpus)
-        || parse_cpu_spec(cpus, &cfg.topo).count() == 0
-    {
-        return err_json(400, "无效的 CPU 规格");
+    if cpus.len() >= 64 {
+        return Err(bad_request("CPU 规格过长"));
     }
+    shared
+        .config()
+        .topo
+        .parse_spec(cpus)
+        .map_err(|e| bad_request(e.to_string()))?;
 
-    let file = lock_ignore_poison(&CONFIG_FILE).clone();
-    match rule_upsert(&file, pkg, thread, cpus) {
-        RuleEdit::Ok => {
-            config_reload_now();
-            (200, json!({ "ok": true }).to_string())
-        }
-        RuleEdit::Malformed => err_json(409, "配置文件存在未闭合块，请修复后重试"),
-        _ => err_json(500, "配置文件写入失败"),
-    }
+    shared
+        .edit_rules(|lines| rule_edit::upsert(lines, pkg, thread, cpus))
+        .map_err(|e| edit_failure(e, "规则不存在"))?;
+    ok()
 }
 
-fn rule_del_api(req: &Request) -> (u16, String) {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
-        return err_json(400, "请求体不是合法 JSON");
+fn rule_del(shared: &Shared, v: &Value) -> ApiResult {
+    let Some(pkg) = str_field(v, "pkg") else {
+        return Err(bad_request("缺少 pkg 字段"));
     };
-    let Some(pkg) = v["pkg"].as_str().map(str::trim) else {
-        return err_json(400, "缺少 pkg 字段");
-    };
-    let thread = v["thread"].as_str().map(str::trim).unwrap_or("");
-
-    let file = lock_ignore_poison(&CONFIG_FILE).clone();
-    let result = if v["all"].as_bool().unwrap_or(false) {
-        rule_delete_pkg(&file, pkg)
-    } else {
-        rule_delete(&file, pkg, thread)
-    };
-    match result {
-        RuleEdit::Ok => {
-            config_reload_now();
-            (200, json!({ "ok": true }).to_string())
-        }
-        RuleEdit::NotFound => err_json(404, "规则不存在"),
-        RuleEdit::Conflict => err_json(409, "状态冲突"),
-        RuleEdit::Malformed => err_json(409, "配置文件存在未闭合块，请修复后重试"),
-        RuleEdit::IoErr => err_json(500, "配置文件写入失败"),
-    }
+    let thread = str_field(v, "thread").unwrap_or("");
+    let all = v["all"].as_bool().unwrap_or(false);
+    shared
+        .edit_rules(|lines| {
+            if all {
+                rule_edit::delete_pkg(lines, pkg)
+            } else {
+                rule_edit::delete(lines, pkg, thread)
+            }
+        })
+        .map_err(|e| edit_failure(e, "规则不存在"))?;
+    ok()
 }
 
-fn rule_rename_api(req: &Request) -> (u16, String) {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
-        return err_json(400, "请求体不是合法 JSON");
-    };
-    let (Some(old), Some(new)) =
-        (v["old"].as_str().map(str::trim), v["new"].as_str().map(str::trim))
-    else {
-        return err_json(400, "缺少 old 或 new 字段");
+fn rule_rename(shared: &Shared, v: &Value) -> ApiResult {
+    let (Some(old), Some(new)) = (str_field(v, "old"), str_field(v, "new")) else {
+        return Err(bad_request("缺少 old 或 new 字段"));
     };
     if !token_ok(old, MAX_PKG_LEN) || !token_ok(new, MAX_PKG_LEN) {
-        return err_json(400, "名称含有非法字符");
+        return Err(bad_request("名称含有非法字符"));
     }
     if !pkg_shape_ok(new) {
-        return err_json(400, "包名含 { 且以 } 结尾时不可作为重命名目标");
+        return Err(bad_request("包名含 { 且以 } 结尾时不可作为重命名目标"));
     }
     if old == new {
-        return (200, json!({ "ok": true }).to_string());
+        return ok();
     }
-
-    let file = lock_ignore_poison(&CONFIG_FILE).clone();
-    match rule_rename(&file, old, new) {
-        RuleEdit::Ok => {
-            config_reload_now();
-            (200, json!({ "ok": true }).to_string())
-        }
-        RuleEdit::NotFound => err_json(404, "原包名不存在"),
-        RuleEdit::Conflict => err_json(409, "目标包名已存在规则"),
-        RuleEdit::Malformed => err_json(409, "配置文件存在未闭合块，请修复后重试"),
-        RuleEdit::IoErr => err_json(500, "配置文件写入失败"),
-    }
+    shared
+        .edit_rules(|lines| rule_edit::rename(lines, old, new))
+        .map_err(|e| edit_failure(e, "原包名不存在"))?;
+    ok()
 }
 
-/// 输入建议
-fn suggest_api(req: &Request) -> (u16, String) {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
-        return err_json(400, "请求体不是合法 JSON");
-    };
-    let q = v["q"].as_str().map(str::trim).unwrap_or("");
+/// 输入补全：不带 pkg 时补全包名，带 pkg 时补全该进程的线程名
+fn suggest(v: &Value) -> ApiResult {
+    let q = str_field(v, "q").unwrap_or("");
     if q.len() > 64 {
-        return err_json(400, "q 过长");
+        return Err(bad_request("q 过长"));
     }
-    let list: Vec<String> = match v["pkg"].as_str().map(str::trim).filter(|p| !p.is_empty()) {
-        None => suggest_pkgs(q).into_iter().map(|(n, _)| n).collect(),
+    let io_err = |e: io::Error| api_err(500, format!("读取 /proc 失败: {e}"));
+    let counts = match str_field(v, "pkg").filter(|p| !p.is_empty()) {
+        None => package_counts().map_err(io_err)?,
         Some(pkg) => {
             if !token_ok(pkg, MAX_PKG_LEN) {
-                return err_json(400, "名称含有非法字符");
+                return Err(bad_request("名称含有非法字符"));
             }
-            suggest_threads(pkg, q).into_iter().map(|(n, _)| n).collect()
+            thread_counts(pkg).map_err(io_err)?
         }
     };
-    (200, json!({ "ok": true, "list": list }).to_string())
+    Ok(json!({ "ok": true, "list": rank_top(counts, q) }))
 }
 
-/// 枚举包名
-fn installed_pkgs() -> Vec<String> {
-    fs::read_dir("/data/data")
-        .map(|dirs| {
-            dirs.flatten()
-                .map(|d| d.file_name().to_string_lossy().into_owned())
-                .filter(|n| n.contains('.') && !n.starts_with('.'))
-                .collect()
-        })
-        .unwrap_or_default()
+/// 已安装应用包名与正在运行的进程名，值为进程数
+fn package_counts() -> io::Result<BTreeMap<String, usize>> {
+    // 受 SELinux 限制读不到已安装列表时，只用运行中的进程名补全
+    let installed = match fs::read_dir("/data/data") {
+        Ok(dir) => dir,
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            return running_counts(BTreeMap::new());
+        }
+        Err(e) => return Err(e),
+    };
+    let counts: BTreeMap<String, usize> = installed
+        .flatten()
+        .map(|d| d.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains('.') && !n.starts_with('.'))
+        .map(|n| (n, 0))
+        .collect();
+    running_counts(counts)
 }
 
-fn for_each_pid(mut f: impl FnMut(i32)) {
-    if let Ok(entries) = fs::read_dir("/proc") {
-        for entry in entries.flatten() {
-            if let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() {
-                f(pid);
+/// 在 counts 上累加正在运行的进程名
+fn running_counts(mut counts: BTreeMap<String, usize>) -> io::Result<BTreeMap<String, usize>> {
+    for pid in procfs::pids()? {
+        if let Some(name) = procfs::cmdline(pid).filter(|n| n.contains('.')) {
+            *counts.entry(name).or_default() += 1;
+        }
+    }
+    Ok(counts)
+}
+
+/// 指定进程名下各线程名出现的次数
+fn thread_counts(pkg: &str) -> io::Result<BTreeMap<String, usize>> {
+    let mut counts = BTreeMap::new();
+    for pid in procfs::pids()? {
+        if procfs::cmdline(pid).as_deref() != Some(pkg) {
+            continue;
+        }
+        for tid in procfs::tids(pid).unwrap_or_default() {
+            if let Some(comm) = procfs::comm(tid) {
+                *counts.entry(comm).or_default() += 1;
             }
         }
     }
+    Ok(counts)
 }
 
-/// 排序键
-fn rank_top(counts: BTreeMap<String, usize>, lq: &str) -> Vec<(String, usize)> {
+/// 前缀匹配优先于子串匹配，同级按出现次数降序，取前 SUGGEST_LIMIT 个名称
+fn rank_top(counts: BTreeMap<String, usize>, query: &str) -> Vec<String> {
+    let q = query.to_ascii_lowercase();
     let mut ranked: Vec<(u8, Reverse<usize>, String)> = counts
         .into_iter()
-        .filter_map(|(n, c)| {
-            let ln = n.to_ascii_lowercase();
-            let r = if ln.starts_with(lq) { 0 } else if ln.contains(lq) { 1 } else { 2 };
-            (r < 2).then_some((r, Reverse(c), n))
+        .filter_map(|(name, n)| {
+            let lower = name.to_ascii_lowercase();
+            let tier = if lower.starts_with(&q) {
+                0
+            } else if lower.contains(&q) {
+                1
+            } else {
+                return None;
+            };
+            Some((tier, Reverse(n), name))
         })
         .collect();
     ranked.sort_unstable();
-    ranked.truncate(20);
-    ranked.into_iter().map(|(_, Reverse(c), n)| (n, c)).collect()
+    ranked.truncate(SUGGEST_LIMIT);
+    ranked.into_iter().map(|(_, _, name)| name).collect()
 }
 
-fn suggest_pkgs(q: &str) -> Vec<(String, usize)> {
-    let mut counts: BTreeMap<String, usize> =
-        installed_pkgs().into_iter().map(|p| (p, 0)).collect();
-    for_each_pid(|pid| {
-        if let Some(name) = read_cmdline(pid).filter(|n| n.contains('.')) {
-            *counts.entry(name).or_insert(0) += 1;
-        }
-    });
-    rank_top(counts, &q.to_ascii_lowercase())
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
 
-fn thread_comm(pid: i32, tid: i32) -> Option<String> {
-    let s = fs::read_to_string(format!("/proc/{}/task/{}/comm", pid, tid)).ok()?;
-    let name = s.trim_end_matches(['\0', '\n']).trim();
-    (!name.is_empty()).then(|| name.to_string())
-}
-
-fn suggest_threads(pkg: &str, q: &str) -> Vec<(String, usize)> {
-    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    for_each_pid(|pid| {
-        if read_cmdline(pid).as_deref() == Some(pkg) {
-            for tid in task_tids(pid).unwrap_or_default() {
-                if let Some(comm) = thread_comm(pid, tid) {
-                    *counts.entry(comm).or_insert(0) += 1;
-                }
-            }
-        }
-    });
-    rank_top(counts, &q.to_ascii_lowercase())
-}
-
-fn config_json() -> String {
-    let stats = lock_ignore_poison(&WEB_STATS).clone();
-    let cfg = current_cfg();
-    json!({
-        "mode": MODE_FORCE.load(Ordering::Relaxed),
-        "mode_active": if stats.is_some_and(|s| s.ebpf) { "ebpf" } else { "proc" },
-        "ebpf_available": ebpf_probe(),
-        "interval": CHECK_INTERVAL.load(Ordering::Relaxed).max(1),
-        "cpuset_name": base_cpuset().rsplit('/').next().unwrap_or_default(),
-        "config_file": lock_ignore_poison(&CONFIG_FILE).clone(),
-        "cpuset_enabled": cfg.is_some_and(|c| c.topo.cpuset_enabled),
-    })
-    .to_string()
-}
-
-fn config_set_api(req: &Request) -> (u16, String) {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
-        return err_json(400, "请求体不是合法 JSON");
-    };
-    let mode = v["mode"].as_u64();
-    let interval = v["interval"].as_u64();
-    let name = v["cpuset_name"].as_str();
-    let path = v["config_file"].as_str();
-
-    if mode.is_some_and(|m| m > 2) {
-        return err_json(400, "无效的工作模式");
-    }
-    if interval.is_some_and(|n| !(1..=3600).contains(&n)) {
-        return err_json(400, "间隔需在 1-3600 秒之间");
-    }
-    if name.is_some_and(|n| !valid_name(n)) {
-        return err_json(400, "无效的 cpuset 目录名");
-    }
-    if path.is_some_and(|p| !valid_path(p)) {
-        return err_json(400, "无效的配置文件路径");
+    fn parse(raw: &str) -> Option<Request> {
+        read_request(&mut Cursor::new(raw.as_bytes().to_vec()))
     }
 
-    if let Some(m) = mode {
-        MODE_FORCE.store(m as u8, Ordering::Relaxed);
-        // 用户主动切回 eBPF 方向时清除放弃标记允许重试
-        if m != 2 {
-            EBPF_GAVE_UP.store(false, Ordering::Relaxed);
-        }
-    }
-    if let Some(n) = interval {
-        CHECK_INTERVAL.store(n, Ordering::Relaxed);
-    }
-    if let Some(n) = name {
-        crate::cpuset::set_base_cpuset(n);
-        if let Some(cfg) = current_cfg()
-            && cfg.topo.cpuset_enabled {
-                create_cpuset_dir(&base_cpuset(), &cfg.topo.present_str, &cfg.topo.mems_str);
-            }
-        FORCE_RELOAD.store(true, Ordering::Release);
-    }
-    if let Some(p) = path {
-        if std::fs::metadata(p).is_err() {
-            let _ = std::fs::write(p, "# 规则编写与使用说明请参考 http://AppOpt.suto.top\n\n");
-        }
-        *lock_ignore_poison(&CONFIG_FILE) = p.to_string();
-        FORCE_RELOAD.store(true, Ordering::Release);
+    #[test]
+    fn parses_post_with_body() {
+        let req = parse("POST /api/rule?x=1 HTTP/1.1\r\nHost: 127.0.0.1:8889\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}").unwrap();
+        assert_eq!(
+            (req.method.as_str(), req.path.as_str(), req.body.as_slice()),
+            ("POST", "/api/rule", &b"{}"[..])
+        );
+        assert!(req.keep_alive);
+        assert!(request_allowed(&req));
     }
 
-    settings_save();
-    (200, json!({ "ok": true }).to_string())
-}
-
-pub const SETTINGS_FILE: &str = "./AppOpt.json";
-
-static SAVE_LOCK: Mutex<()> = Mutex::new(());
-
-#[derive(Clone)]
-pub struct Settings {
-    pub web_enable: bool,
-    pub mode: u8,
-    pub check_interval: u64,
-    pub cpuset_name: String,
-    pub config_file: String,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            web_enable: false,
-            mode: 0,
-            check_interval: 2,
-            cpuset_name: DEFAULT_CPUSET_NAME.to_string(),
-            config_file: "./applist.conf".to_string(),
-        }
-    }
-}
-
-fn valid_name(s: &str) -> bool {
-    !s.is_empty() && s.len() < 64 && !s.contains('/') && !s.bytes().any(|b| b <= b' ')
-}
-
-fn valid_path(s: &str) -> bool {
-    !s.is_empty() && s.len() < 256 && !s.bytes().any(|b| b < 0x20 || b == 0x7f)
-}
-
-impl Settings {
-    fn from_json(v: &Value) -> Self {
-        let d = Settings::default();
-        Self {
-            web_enable: v["web_enable"].as_bool().unwrap_or(d.web_enable),
-            mode: v["mode"].as_u64().unwrap_or(d.mode as u64).min(2) as u8,
-            check_interval: v["check_interval"]
-                .as_u64()
-                .unwrap_or(d.check_interval)
-                .clamp(1, 3600),
-            cpuset_name: v["cpuset_name"]
-                .as_str()
-                .filter(|s| valid_name(s))
-                .unwrap_or(&d.cpuset_name)
-                .to_string(),
-            config_file: v["config_file"]
-                .as_str()
-                .filter(|s| valid_path(s))
-                .unwrap_or(&d.config_file)
-                .to_string(),
-        }
+    #[test]
+    fn rejects_malformed_requests() {
+        assert!(parse("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n").is_none());
+        assert!(parse("POST / HTTP/1.1\r\nContent-Length: 99999\r\n\r\n").is_none());
+        assert!(parse("POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\nshort").is_none());
+        assert!(parse("").is_none());
+        // 无换行的超长头部不会无限读取
+        assert!(parse(&"a".repeat(MAX_HEAD * 4)).is_none());
+        let many = format!("GET / HTTP/1.1\r\n{}\r\n", "X: y\r\n".repeat(MAX_HEAD));
+        assert!(parse(&many).is_none());
     }
 
-    fn to_value(&self) -> Value {
-        json!({
-            "web_enable": self.web_enable,
-            "mode": self.mode,
-            "check_interval": self.check_interval,
-            "cpuset_name": self.cpuset_name,
-            "config_file": self.config_file,
-        })
+    #[test]
+    fn keep_alive_rules() {
+        assert!(
+            !parse("GET / HTTP/1.1\r\nConnection: close\r\n\r\n")
+                .unwrap()
+                .keep_alive
+        );
+        assert!(!parse("GET / HTTP/1.0\r\n\r\n").unwrap().keep_alive);
+        assert!(
+            parse("GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n")
+                .unwrap()
+                .keep_alive
+        );
     }
 
-    fn save(&self, path: &str) {
-        let _guard = lock_ignore_poison(&SAVE_LOCK);
-        let json = serde_json::to_string_pretty(&self.to_value()).unwrap_or_default();
-        let tmp = format!("{}.tmp", path);
-        let res = fs::File::create(&tmp)
-            .and_then(|mut f| {
-                f.write_all(format!("{}\n", json).as_bytes())?;
-                f.sync_all()
-            })
-            .and_then(|_| fs::rename(&tmp, path));
-        if let Err(e) = res {
-            eprintln!("警告: 设置写入 {} 失败: {}", path, e);
-        }
+    #[test]
+    fn origin_and_host_checks() {
+        let ok = |raw: &str| request_allowed(&parse(raw).unwrap());
+        assert!(ok("GET / HTTP/1.1\r\nHost: localhost:8889\r\n\r\n"));
+        assert!(!ok("GET / HTTP/1.1\r\nHost: evil.example\r\n\r\n"));
+        assert!(!ok(
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1:8889\r\nOrigin: http://evil.example\r\nSec-Fetch-Site: cross-site\r\n\r\n"
+        ));
+        assert!(ok(
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1:8889\r\nOrigin: http://127.0.0.1:8889\r\nSec-Fetch-Site: same-origin\r\n\r\n"
+        ));
+        assert!(!ok(
+            "POST / HTTP/1.1\r\nHost: 127.0.0.1:8889\r\nContent-Type: text/plain\r\n\r\n"
+        ));
     }
-}
 
-pub fn settings_load(path: &str) -> Settings {
-    match fs::read_to_string(path) {
-        Ok(text) => match serde_json::from_str::<Value>(&text) {
-            Ok(v) => Settings::from_json(&v),
-            Err(e) => {
-                eprintln!("警告: {} 已损坏({})，使用默认设置", path, e);
-                Settings::default()
-            }
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let d = Settings::default();
-            d.save(path);
-            println!("设置文件不存在，已写入默认设置: {}", path);
-            d
-        }
-        Err(e) => {
-            eprintln!("警告: 读取 {} 失败({})，使用默认设置", path, e);
-            Settings::default()
-        }
+    #[test]
+    fn suggestions_prefer_prefix_then_frequency() {
+        let counts: BTreeMap<String, usize> = [
+            ("com.example.app", 1),
+            ("org.com.other", 9),
+            ("com.zzz", 3),
+            ("unrelated", 5),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        assert_eq!(
+            rank_top(counts.clone(), "COM"),
+            ["com.zzz", "com.example.app", "org.com.other"]
+        );
+        assert_eq!(rank_top(counts, "none"), Vec::<String>::new());
     }
-}
 
-pub fn settings_save() {
-    Settings {
-        web_enable: WEB_ENABLED.load(Ordering::Relaxed),
-        mode: MODE_FORCE.load(Ordering::Relaxed),
-        check_interval: CHECK_INTERVAL.load(Ordering::Relaxed).max(1),
-        cpuset_name: base_cpuset().rsplit('/').next().unwrap_or_default().to_string(),
-        config_file: lock_ignore_poison(&CONFIG_FILE).clone(),
+    #[test]
+    fn web_may_only_switch_to_conf_files() {
+        assert!(config_path_ok("/sdcard/applist.conf"));
+        assert!(config_path_ok("./applist.conf"));
+        assert!(!config_path_ok("/data/adb/service.d/x.sh"));
+        assert!(!config_path_ok("/data/adb/modules/m/service.sh"));
+        assert!(!config_path_ok("/etc/passwd"));
+        assert!(!config_path_ok("conf"));
+        assert!(!config_path_ok(""));
     }
-    .save(SETTINGS_FILE);
+
+    #[test]
+    fn name_rules() {
+        assert!(token_ok("com.a.b", MAX_PKG_LEN));
+        assert!(!token_ok("a#b", MAX_PKG_LEN));
+        assert!(!token_ok("a//b", MAX_PKG_LEN));
+        assert!(!token_ok("a\tb\u{1}", MAX_PKG_LEN));
+        assert!(!token_ok(&"x".repeat(MAX_THREAD_LEN), MAX_THREAD_LEN));
+        assert!(!pkg_shape_ok("a{T}"));
+        assert!(pkg_shape_ok("a{T"));
+    }
 }
