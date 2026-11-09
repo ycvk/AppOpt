@@ -6,23 +6,23 @@
 pub mod cli;
 pub mod config;
 pub mod cpuset;
-pub mod fsutil;
-pub mod glob;
-pub mod grammar;
+mod fsutil;
+mod glob;
+mod grammar;
 pub mod rule_edit;
 pub mod settings;
 pub mod shared;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub mod cache;
+mod cache;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod daemon;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod ebpf_mode;
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub mod proc_mode;
+mod proc_mode;
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub mod procfs;
+mod procfs;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod watcher;
 #[cfg(any(target_os = "linux", target_os = "android"))]
