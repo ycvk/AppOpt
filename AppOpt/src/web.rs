@@ -381,12 +381,11 @@ fn config_path_ok(p: &str) -> bool {
 
 /// 名称校验：非空、长度受限、无控制字符，且不含会被当作注释的 `#` 与 `//`
 fn token_ok(s: &str, max: usize) -> bool {
-    let t = s.trim();
-    !t.is_empty()
-        && t.len() < max
-        && !t.bytes().any(|b| b < 0x20 || b == 0x7f)
-        && !t.contains('#')
-        && !t.contains("//")
+    !s.is_empty()
+        && s.len() < max
+        && !s.bytes().any(|b| b < 0x20 || b == 0x7f)
+        && !s.contains('#')
+        && !s.contains("//")
 }
 
 /// `pkg{...}` 形态在文件里会被解析成单行线程规则，不能作为包名
