@@ -13,6 +13,7 @@ pub const CPU_SETSIZE: usize = 1024;
 const WORD_BITS: usize = u64::BITS as usize;
 const WORDS: usize = CPU_SETSIZE / WORD_BITS;
 
+const SYS_CPU: &str = "/sys/devices/system/cpu";
 pub const SYS_PRESENT: &str = "/sys/devices/system/cpu/present";
 pub const SYS_CPUFREQ: &str = "/sys/devices/system/cpu/cpufreq";
 pub const CPUSET_ROOT: &str = "/dev/cpuset";
@@ -181,7 +182,17 @@ impl CpuSet {
     }
 }
 
-/// 核心分层：按 cpufreq 策略最高频率升序，首组为 e-core，末组为 hp-core，中间各组合并为 p-core
+/// 一个 cpufreq 策略管辖的核心
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cluster {
+    pub max_freq: u64,
+    pub cpus: CpuSet,
+    /// 内核给出的相对性能 cpu_capacity（最强核心为 1024），内核不提供时为 None
+    pub capacity: Option<u64>,
+}
+
+/// 核心分层：最高频率的一档是 hp-core；其余各档中相对性能不到最强一档一半的是小核，其余是 p-core。
+/// e-core 指小核，没有小核时指最低一档。相对性能缺失或不可信时按频率分层：最低一档是 e-core，中间各档是 p-core
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CpuTopology {
     pub present: CpuSet,
@@ -203,7 +214,7 @@ impl CpuTopology {
             }
             Err(e) => return Err(e),
         };
-        let mut groups = Vec::new();
+        let mut clusters = Vec::new();
         for entry in entries.flatten() {
             if !entry.file_name().to_string_lossy().starts_with("policy") {
                 continue;
@@ -222,32 +233,65 @@ impl CpuTopology {
                 cpus.insert(cpu);
             }
             if freq > 0 && !cpus.is_empty() {
-                groups.push((freq, cpus));
+                let capacity = cpus
+                    .iter()
+                    .next()
+                    .and_then(|c| fs::read_to_string(format!("{SYS_CPU}/cpu{c}/cpu_capacity")).ok())
+                    .and_then(|s| s.trim().parse().ok());
+                clusters.push(Cluster {
+                    max_freq: freq,
+                    cpus,
+                    capacity,
+                });
             }
         }
-        Ok(Self::from_groups(present, groups))
+        Ok(Self::from_groups(present, clusters))
     }
 
-    /// 由 (最高频率, 核心集合) 分组构造，同频率分组合并
-    pub fn from_groups(present: CpuSet, groups: impl IntoIterator<Item = (u64, CpuSet)>) -> Self {
-        let mut by_freq: BTreeMap<u64, CpuSet> = BTreeMap::new();
-        for (freq, cpus) in groups {
-            let slot = by_freq.entry(freq).or_default();
-            *slot = slot.union(&cpus);
+    /// 按最高频率把策略分档（同频率合并，相对性能任一缺失即视为缺失），再按类型注释所述规则分层
+    pub fn from_groups(present: CpuSet, clusters: impl IntoIterator<Item = Cluster>) -> Self {
+        let mut by_freq: BTreeMap<u64, (CpuSet, Option<u64>)> = BTreeMap::new();
+        for c in clusters {
+            let slot = by_freq
+                .entry(c.max_freq)
+                .or_insert((CpuSet::default(), c.capacity));
+            slot.0 = slot.0.union(&c.cpus);
+            slot.1 = slot.1.zip(c.capacity).map(|(a, b)| a.max(b));
         }
-        let mut tiers = by_freq.into_values().collect::<Vec<_>>();
-        let hp_core = if tiers.len() >= 2 {
-            tiers.pop().unwrap()
-        } else {
-            CpuSet::default()
+        let mut tiers: Vec<(CpuSet, Option<u64>)> = by_freq.into_values().collect();
+        if tiers.len() < 2 {
+            return Self {
+                present,
+                e_core: tiers.pop().map(|t| t.0).unwrap_or_default(),
+                p_core: CpuSet::default(),
+                hp_core: CpuSet::default(),
+            };
+        }
+        let (hp_core, top_cap) = tiers.pop().expect("至少两档");
+
+        let caps: Option<Vec<u64>> = tiers.iter().map(|t| t.1).collect();
+        let little: Vec<bool> = match (caps, top_cap) {
+            (Some(caps), Some(top)) if caps.iter().all(|&c| c < top) => {
+                caps.iter().map(|&c| c * 2 < top).collect()
+            }
+            _ => (0..tiers.len()).map(|i| i == 0).collect(),
         };
-        let mut tiers = tiers.into_iter();
-        let e_core = tiers.next().unwrap_or_default();
-        let p_core = tiers.fold(CpuSet::default(), |acc, t| acc.union(&t));
+        let pick = |want: bool| {
+            tiers
+                .iter()
+                .zip(&little)
+                .filter(|&(_, &l)| l == want)
+                .fold(CpuSet::default(), |acc, ((cpus, _), _)| acc.union(cpus))
+        };
+        let little_cores = pick(true);
         Self {
             present,
-            e_core,
-            p_core,
+            e_core: if little_cores.is_empty() {
+                tiers[0].0
+            } else {
+                little_cores
+            },
+            p_core: pick(false),
             hp_core,
         }
     }
@@ -438,13 +482,21 @@ mod tests {
         CpuSet::parse_list(spec).unwrap()
     }
 
+    fn cl(max_freq: u64, cpus: &str, capacity: Option<u64>) -> Cluster {
+        Cluster {
+            max_freq,
+            cpus: set(cpus),
+            capacity,
+        }
+    }
+
     fn topo_3tier() -> CpuTopology {
         CpuTopology::from_groups(
             set("0-7"),
             [
-                (1800000, set("0-3")),
-                (2400000, set("4-6")),
-                (3000000, set("7")),
+                cl(1800000, "0-3", None),
+                cl(2400000, "4-6", None),
+                cl(3000000, "7", None),
             ],
         )
     }
@@ -475,13 +527,13 @@ mod tests {
         assert_eq!(t.p_core, set("4-6"));
         assert_eq!(t.hp_core, set("7"));
 
-        let two = CpuTopology::from_groups(set("0-7"), [(1, set("0-3")), (2, set("4-7"))]);
+        let two = CpuTopology::from_groups(set("0-7"), [cl(1, "0-3", None), cl(2, "4-7", None)]);
         assert_eq!(
             (two.e_core, two.p_core, two.hp_core),
             (set("0-3"), set(""), set("4-7"))
         );
 
-        let one = CpuTopology::from_groups(set("0-3"), [(1, set("0-1")), (1, set("2-3"))]);
+        let one = CpuTopology::from_groups(set("0-3"), [cl(1, "0-1", None), cl(1, "2-3", None)]);
         assert_eq!(
             (one.e_core, one.p_core, one.hp_core),
             (set("0-3"), set(""), set(""))
@@ -489,6 +541,75 @@ mod tests {
 
         let none = CpuTopology::from_groups(set("0-3"), []);
         assert!(none.e_core.is_empty() && none.hp_core.is_empty());
+    }
+
+    #[test]
+    fn mid_cores_are_not_called_little() {
+        // 骁龙 8 至尊版（一加 13 实测）：cpu0-5 相对性能 792、最高 3.53 GHz，cpu6-7 为 1024、4.32 GHz
+        let elite = CpuTopology::from_groups(
+            set("0-7"),
+            [
+                cl(3_532_800, "0-5", Some(792)),
+                cl(4_320_000, "6-7", Some(1024)),
+            ],
+        );
+        assert_eq!(
+            (elite.e_core, elite.p_core, elite.hp_core),
+            (set("0-5"), set("0-5"), set("6-7"))
+        );
+        assert_eq!(elite.parse_spec("p-core,hp-core"), Ok(set("0-7")));
+        assert_eq!(elite.parse_spec("p-core"), Ok(set("0-5")));
+        assert_eq!(elite.parse_spec("e-core"), Ok(set("0-5")));
+    }
+
+    #[test]
+    fn capacity_separates_little_from_mid() {
+        let tiers = |t: CpuTopology| (t.e_core, t.p_core, t.hp_core);
+        // 小核 + 两档中核 + 超大核（8 Gen 3 式）：与按频率分层结果一致
+        let gen3 = CpuTopology::from_groups(
+            set("0-7"),
+            [
+                cl(2_265_600, "0-1", Some(325)),
+                cl(2_956_800, "5-6", Some(870)),
+                cl(3_148_800, "2-4", Some(890)),
+                cl(3_302_400, "7", Some(1024)),
+            ],
+        );
+        assert_eq!(tiers(gen3), (set("0-1"), set("2-6"), set("7")));
+
+        // 两档大小核：没有中核
+        let bl = CpuTopology::from_groups(
+            set("0-7"),
+            [
+                cl(2_000_000, "0-3", Some(380)),
+                cl(2_800_000, "4-7", Some(1024)),
+            ],
+        );
+        assert_eq!(tiers(bl), (set("0-3"), set(""), set("4-7")));
+
+        // 全大核且有两档中核：e-core 取最低一档，p-core 含全部中核
+        let all_big = CpuTopology::from_groups(
+            set("0-7"),
+            [
+                cl(2_400_000, "0-3", Some(620)),
+                cl(3_300_000, "4-6", Some(910)),
+                cl(3_620_000, "7", Some(1024)),
+            ],
+        );
+        assert_eq!(tiers(all_big), (set("0-3"), set("0-6"), set("7")));
+
+        // 相对性能缺失或不可信（不低于最强一档）时按频率分层
+        for caps in [
+            [None, Some(1024)],
+            [Some(1024), Some(1024)],
+            [Some(400), None],
+        ] {
+            let t = CpuTopology::from_groups(
+                set("0-7"),
+                [cl(1_800_000, "0-5", caps[0]), cl(3_000_000, "6-7", caps[1])],
+            );
+            assert_eq!(tiers(t), (set("0-5"), set(""), set("6-7")), "{caps:?}");
+        }
     }
 
     #[test]

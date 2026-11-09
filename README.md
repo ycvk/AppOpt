@@ -42,7 +42,13 @@ CPU 写法：
 - 语义核心：`e-core` 能效小核、`p-core` 性能中核、`hp-core` 高性能大核、`all-core` 全部核心。
 - 两者可以用逗号混写，如 `e-core,p-core`、`e-core,7`。
 
-语义核心按各 cpufreq 策略的 `cpuinfo_max_freq` 分层：最低一档是 `e-core`，最高一档是 `hp-core`，中间各档合并为 `p-core`。只有一档时全部算 `e-core`，两档时没有 `p-core`。
+语义核心按 cpufreq 策略分档（同一最高频率 `cpuinfo_max_freq` 的策略算一档）：
+
+- 最高的一档是 `hp-core`。
+- 其余各档里，相对性能（内核给出的 `cpu_capacity`，最强核心为 1024）不到最高一档一半的是小核，其余合并为 `p-core`。
+- `e-core` 指小核。没有小核的芯片（如骁龙 8 至尊版的 6 个性能核加 2 个超大核）上，`e-core` 指最低一档，此时它也包含在 `p-core` 里。
+- 内核不提供 `cpu_capacity`，或数值不低于最高一档时，按频率分层：最低一档是 `e-core`，中间各档是 `p-core`。
+- 只有一档时全部算 `e-core`，`p-core` 和 `hp-core` 为空。
 
 匹配细则：
 

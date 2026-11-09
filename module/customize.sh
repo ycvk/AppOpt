@@ -74,53 +74,43 @@ format_cpu_ranges() {
 		printf (start == last ? start : start "-" last)
 	}'
 }
+# 每个 cpufreq 策略一行 "最高频率:核心:相对性能"，同频率合并；相对性能（cpu_capacity）任一缺失即留空
 sorted_groups=$(
 	for policy in /sys/devices/system/cpu/cpufreq/policy*; do
 		[ -d "$policy" ] || continue
 		cpus=$(cat "$policy/related_cpus" 2>/dev/null)
 		freq=$(cat "$policy/cpuinfo_max_freq" 2>/dev/null)
 		[ -z "$cpus" ] || [ -z "$freq" ] && continue
-		echo "$freq:$cpus"
+		cap=$(cat "/sys/devices/system/cpu/cpu${cpus%% *}/cpu_capacity" 2>/dev/null)
+		echo "$freq:$cpus:$cap"
 	done | sort -n -t: -k1,1 | awk -F: '
-	$1 == prev { cores = cores " " $2; next }
-	prev != "" { print prev ":" cores; cores = "" }
-	{ prev = $1; cores = $2 }
-	END { if (prev != "") print prev ":" cores }'
+	$1 == prev { cores = cores " " $2; if ($3 == "" || cap == "") cap = ""; else if ($3 + 0 > cap + 0) cap = $3; next }
+	prev != "" { print prev ":" cores ":" cap }
+	{ prev = $1; cores = $2; cap = $3 }
+	END { if (prev != "") print prev ":" cores ":" cap }'
 )
+# 与主程序一致：最高一档为大核；其余各档相对性能不到最强一档一半的是小核，其余是中核；
+# 没有小核时 e_core 取最低一档；相对性能缺失或不可信时最低一档为小核
 eval "$(echo "$sorted_groups" | awk -F: '
-BEGIN {
-	e_core = ""; p_core = ""; hp_core = ""
-	e_core_freq = 0; p_core_freq = 0; hp_core_freq = 0
-	total_groups = 0
-}
-{
-	freq_arr[NR] = $1
-	cpus_arr[NR] = $2
-	total_groups = NR
-}
+NF { n++; freq[n] = $1; cpus[n] = $2; cap[n] = $3 }
 END {
-	if (total_groups == 0) {
-		print "e_core=\"\"; e_core_freq=0; p_core=\"\"; p_core_freq=0; hp_core=\"\"; hp_core_freq=0; total_groups=0;"
-		exit
-	}
-	e_core = cpus_arr[1]
-	e_core_freq = freq_arr[1]
-	if (total_groups >= 2) {
-		hp_core = cpus_arr[total_groups]
-		hp_core_freq = freq_arr[total_groups]
-	}
-	if (total_groups >= 3) {
-		p_core = ""
-		p_core_freq = 0
-		for (i = 2; i < total_groups; i++) {
-			p_core = p_core (p_core == "" ? "" : " ") cpus_arr[i]
-			if (freq_arr[i] > p_core_freq) p_core_freq = freq_arr[i]
+	e = ""; p = ""; hp = ""; ef = 0; pf = 0; hf = 0; little = 0
+	if (n == 1) { e = cpus[1]; ef = freq[1] }
+	if (n >= 2) {
+		hp = cpus[n]; hf = freq[n]
+		usable = (cap[n] != "")
+		for (i = 1; i < n; i++) if (cap[i] == "" || cap[i] + 0 >= cap[n] + 0) usable = 0
+		for (i = 1; i < n; i++) {
+			if (usable ? (cap[i] * 2 < cap[n] + 0) : (i == 1)) {
+				e = e (e == "" ? "" : " ") cpus[i]; if (freq[i] > ef) ef = freq[i]; little = 1
+			} else {
+				p = p (p == "" ? "" : " ") cpus[i]; if (freq[i] > pf) pf = freq[i]
+			}
 		}
+		if (!little) { e = cpus[1]; ef = freq[1] }
 	}
-	printf "e_core=\"%s\"; e_core_freq=%d; ", e_core, e_core_freq
-	printf "p_core=\"%s\"; p_core_freq=%d; ", p_core, p_core_freq
-	printf "hp_core=\"%s\"; hp_core_freq=%d; ", hp_core, hp_core_freq
-	printf "total_groups=%d;", total_groups
+	printf "e_core=\"%s\"; e_core_freq=%d; p_core=\"%s\"; p_core_freq=%d; ", e, ef, p, pf
+	printf "hp_core=\"%s\"; hp_core_freq=%d; has_little=%d;", hp, hf, little
 }')"
 all_core="$(cat /sys/devices/system/cpu/present)"
 module_instructions() {
@@ -136,9 +126,15 @@ module_instructions() {
 	ui_print "当前$(getprop ro.soc.model)设备为$(nproc)核CPU，规格是：$cores"
 	ui_print "可用CPU范围：$all_core"
 	ui_print "------------------------------------------"
-	[ -n "$(format_cpu_ranges "$e_core")" ] && echo "$(format_cpu_ranges "$e_core") 为能效小核，频率最高$((e_core_freq/1000)) MHz"
-	[ $total_groups -ge 3 ] && [ -n "$(format_cpu_ranges "$p_core")" ] && echo "$(format_cpu_ranges "$p_core") 为性能中核，频率最高$((p_core_freq/1000)) MHz"
-	[ $total_groups -ge 2 ] && [ -n "$(format_cpu_ranges "$hp_core")" ] && echo "$(format_cpu_ranges "$hp_core") 为高性能大核，频率最高$((hp_core_freq/1000)) MHz"
+	[ "$has_little" = 1 ] && echo "$(format_cpu_ranges "$e_core") 为能效小核，频率最高$((e_core_freq/1000)) MHz"
+	[ -n "$p_core" ] && echo "$(format_cpu_ranges "$p_core") 为性能中核，频率最高$((p_core_freq/1000)) MHz"
+	[ -n "$hp_core" ] && echo "$(format_cpu_ranges "$hp_core") 为高性能大核，频率最高$((hp_core_freq/1000)) MHz"
+	if [ "$has_little" = 1 ]; then
+		low_name="能效小核"
+	else
+		low_name="最省电的一组核心"
+		[ -n "$hp_core" ] && echo "这颗芯片没有能效小核，规则里的 e-core 指 $(format_cpu_ranges "$e_core")"
+	fi
 	ui_print "------------------------------------------"
 	ui_print "applist.conf 规则写法示例："
 	ui_print "------------------------------------------"
@@ -147,22 +143,22 @@ module_instructions() {
 		ui_print "surfaceflinger=$all_core"
 		ui_print "------------------------------------------"
 	fi
-	if [ -n "$(format_cpu_ranges "$hp_core")" ]; then
+	if [ -n "$hp_core" ]; then
 		ui_print "单独将'图形显示组件'渲染引擎线程绑定到大核："
 		ui_print "surfaceflinger{RenderEngine}=$(format_cpu_ranges "$hp_core")"
 		ui_print "------------------------------------------"
 	fi
-	if [ -n "$(format_cpu_ranges "$e_core")" ]; then
-		ui_print "将 '微信' 主进程绑定能效小核："
+	if [ -n "$hp_core" ]; then
+		ui_print "将 '微信' 主进程绑定${low_name}："
 		ui_print "com.tencent.mm=$(format_cpu_ranges "$e_core")"
 		ui_print "------------------------------------------"
 	fi
-	if [ -n "$(format_cpu_ranges "$e_core")" ]; then
-		ui_print "将 '微信' 消息推送子进程绑定能效小核："
+	if [ -n "$hp_core" ]; then
+		ui_print "将 '微信' 消息推送子进程绑定${low_name}："
 		ui_print "com.tencent.mm:push=$(format_cpu_ranges "$e_core")"
 		ui_print "------------------------------------------"
 	fi
-	if [ -n "$(format_cpu_ranges "$hp_core")" ]; then
+	if [ -n "$hp_core" ]; then
 		ui_print "将 '系统界面' 渲染线程绑定到性能大核："
 		ui_print "com.android.systemui{RenderThread}=$(format_cpu_ranges "$hp_core")"
 		ui_print "------------------------------------------"

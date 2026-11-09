@@ -369,7 +369,7 @@ function appName(pkg) {
 }
 
 // ---- 核心拓扑与运行方式 ----
-let topo = null; // {e, p, h, all: Set<number>, sorted: number[], tiered}
+let topo = null; // {e, p, h, all: Set<number>, sorted: number[], tiered, little}
 const sameSet = (a, b) => a && b && a.size === b.size && [...a].every(x => b.has(x));
 const union = (...s) => new Set(s.flatMap(x => [...x]));
 function parseList(s) {
@@ -390,7 +390,9 @@ function setTopo(st) {
   const e = parseList(st.e_core || '') || new Set(), p = parseList(st.p_core || '') || new Set(), h = parseList(st.hp_core || '') || new Set();
   const key = [st.all_core, st.e_core, st.p_core, st.hp_core].join('|');
   if (topo && topo.key === key) return false;
-  topo = {key, all, e, p, h, sorted: [...all].sort((x, y) => x - y), tiered: e.size > 0 && h.size > 0};
+  // 没有小核的芯片上 e-core 指最低一档中核，此时 e-core 包含在 p-core 里
+  const little = e.size > 0 && ![...e].every(c => p.has(c));
+  topo = {key, all, e, p, h, sorted: [...all].sort((x, y) => x - y), tiered: h.size > 0 && e.size > 0, little};
   return true;
 }
 // 规格（语义名与编号可混写）→ 本机核心集合；写法不对返回 null
@@ -411,14 +413,26 @@ function presets() {
   const list = [];
   if (topo && topo.tiered) {
     const mid = topo.p.size > 0;
-    list.push({id: 'eco', name: '省电', cores: '小核', desc: '只用小核，适合后台常驻的应用', spec: 'e-core', set: topo.e});
-    if (mid) list.push({id: 'bal', name: '均衡', cores: '小核和中核', desc: '小核和中核', spec: 'e-core,p-core', set: union(topo.e, topo.p)});
-    if (mid) list.push({id: 'smooth', name: '流畅', cores: '中核和大核', desc: '中核和大核，适合游戏和常用应用', spec: 'p-core,hp-core', set: union(topo.p, topo.h)});
+    if (topo.little) {
+      list.push({id: 'eco', name: '省电', cores: '小核', desc: '只用小核，适合后台常驻的应用', spec: 'e-core', set: topo.e});
+      if (mid) list.push({id: 'bal', name: '均衡', cores: '小核和中核', desc: '小核和中核', spec: 'e-core,p-core', set: union(topo.e, topo.p)});
+      if (mid) list.push({id: 'smooth', name: '流畅', cores: '中核和大核', desc: '中核和大核，适合游戏和常用应用', spec: 'p-core,hp-core', set: union(topo.p, topo.h)});
+    } else {
+      const allMid = sameSet(topo.e, topo.p);
+      list.push({id: 'eco', name: '省电', cores: allMid ? '中核' : '最省电的中核', desc: allMid ? '只用中核，不用大核，适合后台常驻的应用' : '只用最省电的一组中核，适合后台常驻的应用', spec: 'e-core', set: topo.e});
+      list.push({id: 'bal', name: '均衡', cores: '中核', desc: '全部中核，不用大核', spec: 'p-core', set: topo.p});
+    }
     list.push({id: 'power', name: '性能', cores: '大核', desc: '只用大核', spec: 'hp-core', set: topo.h});
   }
   list.push({id: 'all', name: '不限制', cores: '全部核心', desc: '所有核心都能用', spec: 'all-core', set: topo ? topo.all : new Set()});
   list.push({id: 'custom', name: '自定义', cores: '手动填写', desc: '手动填写核心编号', spec: null, set: null});
-  return list;
+  // 去掉与前面某项或“不限制”效果相同的选项
+  const kept = [];
+  return list.filter(p => {
+    if (p.set && (kept.some(k => sameSet(k, p.set)) || (p.id !== 'all' && sameSet(p.set, topo?.all)))) return false;
+    if (p.set) kept.push(p.set);
+    return true;
+  });
 }
 const presetById = id => presets().find(p => p.id === id);
 function choiceOf(spec) {
@@ -434,7 +448,7 @@ function labelOf(spec) {
 }
 function tierOf(c) {
   if (!topo.tiered) return 'n';
-  return topo.e.has(c) ? 'e' : topo.p.has(c) ? 'p' : topo.h.has(c) ? 'h' : 'n';
+  return topo.h.has(c) ? 'h' : topo.p.has(c) ? 'p' : topo.e.has(c) ? 'e' : 'n';
 }
 function strip(set) {
   if (!topo) return '';
@@ -447,12 +461,14 @@ function renderDie() {
   const die = $('#die');
   if (!topo || !topo.all.size) { die.hidden = true; return; }
   const groups = topo.tiered
-    ? [['e', '小核', topo.e], ['p', '中核', topo.p], ['h', '大核', topo.h]].filter(g => g[2].size)
+    ? [['e', '小核', topo.little ? topo.e : new Set()], ['p', '中核', topo.p], ['h', '大核', topo.h]].filter(g => g[2].size)
     : [['n', '核心', topo.all]];
   die.innerHTML = groups.map(([k, label, set]) =>
     `<div class="cluster"><div class="tiles">${[...set].sort((a, b) => a - b).map(c => `<i class="t ${k} on" style="--i:${c}"></i>`).join('')}</div><div class="cluster-label">${set.size} 个${label}</div></div>`).join('');
   die.setAttribute('aria-label', `本机 CPU：${groups.map(([, l, s]) => `${s.size} 个${l}`).join('，')}`);
   die.hidden = false;
+  const low = topo.little ? '小核' : '中核';
+  $('#tip').textContent = `${low}省电，大核快。后台常驻的应用放${low}，游戏放大核。`;
   $('#tip').hidden = !topo.tiered;
   die.classList.remove('reveal');
   void die.offsetWidth;

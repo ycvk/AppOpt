@@ -231,13 +231,16 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cpuset::Cluster;
 
     fn topo() -> CpuTopology {
         let set = |s| CpuSet::parse_list(s).unwrap();
-        CpuTopology::from_groups(
-            set("0-7"),
-            [(1, set("0-3")), (2, set("4-6")), (3, set("7"))],
-        )
+        let cl = |max_freq, cpus| Cluster {
+            max_freq,
+            cpus: set(cpus),
+            capacity: None,
+        };
+        CpuTopology::from_groups(set("0-7"), [cl(1, "0-3"), cl(2, "4-6"), cl(3, "7")])
     }
 
     fn cfg(text: &str) -> AppConfig {

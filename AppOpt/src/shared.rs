@@ -288,7 +288,7 @@ impl Shared {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::cpuset::CpuSet;
+    use crate::cpuset::{Cluster, CpuSet};
     use crate::rule_edit;
 
     pub(crate) fn fixture(name: &str, rules: &str) -> (Shared, PathBuf) {
@@ -302,7 +302,12 @@ pub(crate) mod tests {
             ..Settings::default()
         };
         let set = |s| CpuSet::parse_list(s).unwrap();
-        let topo = CpuTopology::from_groups(set("0-7"), [(1, set("0-3")), (2, set("4-7"))]);
+        let cl = |max_freq, cpus| Cluster {
+            max_freq,
+            cpus: set(cpus),
+            capacity: None,
+        };
+        let topo = CpuTopology::from_groups(set("0-7"), [cl(1, "0-3"), cl(2, "4-7")]);
         let shared = Shared::new(settings, dir.join("AppOpt.json"), topo, None).unwrap();
         (shared, dir)
     }
