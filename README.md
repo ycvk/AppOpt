@@ -2,6 +2,14 @@
 
 Android 线程 CPU 亲和性优化模块。以 root 常驻后台，按规则把指定应用的进程或线程放到合适的 CPU 核心上：后台常驻的应用放在省电的核心，游戏和常用应用的关键线程放在大核。规则用网页面板就能设置，也可以直接编辑规则文件，保存后立即生效。
 
+<p>
+  <img src="docs/images/panel-home.jpg" alt="网页面板首页：运行状态、本机核心图和已添加的应用" width="260">
+  <img src="docs/images/panel-edit.jpg" alt="调整应用：选择运行方式，按线程单独设置" width="260">
+  <img src="docs/images/panel-settings.jpg" alt="设置：工作方式与检查间隔" width="260">
+</p>
+
+网页面板截图，来自一加 13（骁龙 8 至尊版）上实际运行的 AppOpt。
+
 基于 Suto 的 [AppOptR](https://gitee.com/sutoliu/AppOptR) 二次开发，以 GPL-3.0 发布，见 [LICENSE](LICENSE)。
 
 ## 安装
