@@ -27,7 +27,7 @@ extract_bin() {
 	if [ "$ARCH" == "arm64" ]; then
 		cp $MODPATH/bin/arm64-v8a/AppOpt* $MODPATH
 	elif [ "$ARCH" == "x64" ]; then
-		cp $MODPATH/bin/x86_64/AppOpt -v $MODPATH
+		cp $MODPATH/bin/x86_64/AppOpt* $MODPATH
 	else
 		abort "! Unsupported platform: $ARCH"
 	fi
