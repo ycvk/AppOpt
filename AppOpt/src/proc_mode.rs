@@ -95,18 +95,8 @@ impl ProcMode {
         let walk = procfs::walk(cfg, |pid| scan_all || tracked.contains(&pid))?;
 
         self.cache.clear();
-        for &(pid, group) in &walk.hits {
-            let Some(tids) = procfs::tids(pid) else {
-                continue;
-            };
-            for tid in tids {
-                let comm = if group.has_thread_rules() {
-                    procfs::comm(tid).unwrap_or_default()
-                } else {
-                    String::new()
-                };
-                self.cache.fill(cfg, group, tid, pid, &comm);
-            }
+        for (pid, group, tid, comm) in walk.threads() {
+            self.cache.fill(cfg, group, tid, pid, &comm);
         }
 
         if scan_all {

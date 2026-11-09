@@ -66,6 +66,22 @@ pub struct Walk<'a> {
     pub total: usize,
 }
 
+impl<'a> Walk<'a> {
+    /// 命中进程的全部线程 (pid, group, tid, comm)；只有带线程规则的包才读取线程名
+    pub fn threads(&self) -> impl Iterator<Item = (i32, &'a PkgGroup, i32, String)> + '_ {
+        self.hits.iter().flat_map(|&(pid, group)| {
+            tids(pid).into_iter().flatten().map(move |tid| {
+                let name = if group.has_thread_rules() {
+                    comm(tid).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                (pid, group, tid, name)
+            })
+        })
+    }
+}
+
 /// 遍历 /proc，对 want 为真的进程读取进程名并匹配规则
 pub fn walk<'a>(cfg: &'a AppConfig, want: impl Fn(i32) -> bool) -> io::Result<Walk<'a>> {
     let mut hits = Vec::new();

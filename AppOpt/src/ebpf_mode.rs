@@ -289,21 +289,11 @@ impl Ebpf {
         self.cache.clear();
         self.applied_clear();
         let walk = procfs::walk(cfg, |_| true)?;
-        for &(pid, group) in &walk.hits {
-            let Some(tids) = procfs::tids(pid) else {
-                continue;
-            };
-            for tid in tids {
-                let comm = if group.has_thread_rules() {
-                    procfs::comm(tid).unwrap_or_default()
-                } else {
-                    String::new()
-                };
-                match self.cache.apply(cfg, group, tid, pid, &comm) {
-                    Outcome::Bound => self.applied_set(tid),
-                    Outcome::Gone => self.applied_del(tid),
-                    Outcome::Kept | Outcome::NoRule => {}
-                }
+        for (pid, group, tid, comm) in walk.threads() {
+            match self.cache.apply(cfg, group, tid, pid, &comm) {
+                Outcome::Bound => self.applied_set(tid),
+                Outcome::Gone => self.applied_del(tid),
+                Outcome::Kept | Outcome::NoRule => {}
             }
         }
         Ok(())
