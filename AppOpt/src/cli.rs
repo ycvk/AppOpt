@@ -1,8 +1,8 @@
 //! 命令行参数
 
 use crate::settings::{
-    DEFAULT_CONFIG_FILE, DEFAULT_CPUSET_NAME, DEFAULT_INTERVAL, INTERVAL_RANGE, Settings,
-    valid_cpuset_name, valid_path,
+    DEFAULT_CONFIG_FILE, DEFAULT_CPUSET_NAME, DEFAULT_INTERVAL, INTERVAL_RANGE, SETTINGS_FILE,
+    Settings, valid_cpuset_name, valid_path,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -55,8 +55,9 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                         .filter(|n| INTERVAL_RANGE.contains(n))
                         .ok_or_else(|| {
                             format!(
-                                "无效的时间间隔: {v}
-间隔必须是 1-3600 的整数"
+                                "无效的时间间隔: {v}\n间隔必须是 {}-{} 的整数",
+                                INTERVAL_RANGE.start(),
+                                INTERVAL_RANGE.end()
                             )
                         })?,
                 );
@@ -84,7 +85,7 @@ pub fn usage(prog: &str) -> String {
         "Usage: {prog} [OPTIONS]
 Options:
   -c <config_file>   指定配置文件 (默认: {DEFAULT_CONFIG_FILE})
-  -s <interval>      设置检查间隔(秒) (1-3600, 默认: {DEFAULT_INTERVAL})
+  -s <interval>      设置检查间隔(秒) ({lo}-{hi}, 默认: {DEFAULT_INTERVAL})
   -b <cpuset_name>   指定 BASE_CPUSET 目录名 (默认: {DEFAULT_CPUSET_NAME})
   -w                 启用网页前端 (仅本机 127.0.0.1:8889)
   -v                 显示程序版本
@@ -94,7 +95,7 @@ Options:
   {prog} -c /data/applist.conf -s 3
   {prog} -b MyAppOpt
 
-应用设置保存于 ./AppOpt.json，首次运行自动创建；
+应用设置保存于 {SETTINGS_FILE}，首次运行自动创建；
 命令行参数优先于设置文件，web 端修改会写回该文件。
 
 规则格式:
@@ -110,7 +111,9 @@ Options:
     Thread-1=0-5
   }}
   线程 RenderThread 绑定到 CPU 6-7
-  线程 Thread-1 绑定到 CPU 0-5"
+  线程 Thread-1 绑定到 CPU 0-5",
+        lo = INTERVAL_RANGE.start(),
+        hi = INTERVAL_RANGE.end()
     )
 }
 

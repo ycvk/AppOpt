@@ -15,7 +15,9 @@ use serde_json::{Value, json};
 
 use crate::config::{MAX_PKG_LEN, MAX_THREAD_LEN};
 use crate::rule_edit::{self, EditError};
-use crate::settings::{opt_field, parse_cpuset_name, parse_interval, parse_mode, valid_path};
+use crate::settings::{
+    INTERVAL_RANGE, opt_field, parse_cpuset_name, parse_interval, parse_mode, valid_path,
+};
 use crate::shared::{ConfigPatch, RuleEditError, Shared};
 use crate::{ebpf_mode, procfs};
 
@@ -323,7 +325,13 @@ fn config(shared: &Shared) -> Value {
 fn config_set(shared: &Shared, v: &Value) -> ApiResult {
     let bad = |msg: &'static str| move || bad_request(msg);
     let mode = opt_field(v, "mode", parse_mode, bad("无效的工作模式"))?;
-    let interval = opt_field(v, "interval", parse_interval, bad("间隔需在 1-3600 秒之间"))?;
+    let interval = opt_field(v, "interval", parse_interval, || {
+        bad_request(format!(
+            "间隔需在 {}-{} 秒之间",
+            INTERVAL_RANGE.start(),
+            INTERVAL_RANGE.end()
+        ))
+    })?;
     let cpuset_name = opt_field(
         v,
         "cpuset_name",
