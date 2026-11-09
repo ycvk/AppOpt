@@ -26,7 +26,7 @@ pub struct CpuSet {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const _: () = {
-    assert!(std::mem::size_of::<CpuSet>() == std::mem::size_of::<libc::cpu_set_t>());
+    assert!(size_of::<CpuSet>() == size_of::<libc::cpu_set_t>());
     assert!(cfg!(target_endian = "little"));
 };
 
