@@ -666,4 +666,60 @@ mod tests {
         assert!(!pkg_shape_ok("a{T}"));
         assert!(pkg_shape_ok("a{T"));
     }
+
+    fn shared_fixture(name: &str) -> (Shared, std::path::PathBuf) {
+        use crate::cpuset::{CpuSet, CpuTopology};
+        use crate::settings::Settings;
+        let dir = std::env::temp_dir().join(format!("appopt-web-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("applist.conf");
+        fs::write(&conf, "a=0\n").unwrap();
+        let settings = Settings {
+            config_file: conf.to_string_lossy().into_owned(),
+            ..Settings::default()
+        };
+        let set = |s| CpuSet::parse_list(s).unwrap();
+        let topo = CpuTopology::from_groups(set("0-7"), [(1, set("0-3")), (2, set("4-7"))]);
+        let shared = Shared::new(settings, dir.join("AppOpt.json"), topo, None).unwrap();
+        (shared, dir)
+    }
+
+    #[test]
+    fn config_set_validates_each_field() {
+        let (s, dir) = shared_fixture("cfgset");
+        let before = s.settings();
+        for (body, msg) in [
+            (json!({"mode": 3}), "无效的工作模式"),
+            (json!({"mode": "1"}), "无效的工作模式"),
+            (json!({"interval": 0}), "间隔需在 1-3600 秒之间"),
+            (json!({"interval": 3601}), "间隔需在 1-3600 秒之间"),
+            (json!({"interval": "2"}), "间隔需在 1-3600 秒之间"),
+            (json!({"cpuset_name": "a/b"}), "无效的 cpuset 目录名"),
+            (json!({"cpuset_name": 5}), "无效的 cpuset 目录名"),
+            (
+                json!({"config_file": "/x/y.txt"}),
+                "无效的配置文件路径，文件名需以 .conf 结尾",
+            ),
+            (
+                json!({"config_file": 1}),
+                "无效的配置文件路径，文件名需以 .conf 结尾",
+            ),
+            (json!({"mode": 1, "interval": 0}), "间隔需在 1-3600 秒之间"),
+        ] {
+            match config_set(&s, &body) {
+                Err(ApiError(status, m)) => assert_eq!((status, m.as_str()), (400, msg), "{body}"),
+                Ok(_) => panic!("应拒绝 {body}"),
+            }
+        }
+        assert_eq!(s.settings(), before);
+
+        // 缺省与 null 视为未提供
+        assert!(config_set(&s, &json!({"mode": null, "cpuset_name": null})).is_ok());
+        assert_eq!(s.settings(), before);
+        assert!(config_set(&s, &json!({"mode": 2, "interval": 7})).is_ok());
+        let after = s.settings();
+        assert_eq!((after.mode, after.check_interval), (Mode::Proc, 7));
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }

@@ -198,6 +198,24 @@ mod tests {
     }
 
     #[test]
+    fn invalid_values_name_the_field() {
+        for (v, key) in [
+            (json!({"web_enable": "yes"}), "web_enable"),
+            (json!({"mode": 9}), "mode"),
+            (json!({"check_interval": 0}), "check_interval"),
+            (json!({"cpuset_name": ""}), "cpuset_name"),
+            (json!({"config_file": 3}), "config_file"),
+            (json!({"mode": 9, "check_interval": 0}), "mode"),
+        ] {
+            assert_eq!(
+                Settings::from_json(&v).unwrap_err(),
+                format!("字段 {key} 的取值无效"),
+                "{v}"
+            );
+        }
+    }
+
+    #[test]
     fn roundtrip_and_load_rules() {
         let dir = std::env::temp_dir().join(format!("appopt-settings-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
