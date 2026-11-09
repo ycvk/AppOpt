@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 
 use crate::config::{MAX_PKG_LEN, MAX_THREAD_LEN};
 use crate::rule_edit::{self, EditError};
-use crate::settings::{INTERVAL_RANGE, Mode, valid_cpuset_name, valid_path};
+use crate::settings::{opt_field, parse_cpuset_name, parse_interval, parse_mode, valid_path};
 use crate::shared::{ConfigPatch, RuleEditError, Shared};
 use crate::{ebpf_mode, procfs};
 
@@ -320,47 +320,21 @@ fn config(shared: &Shared) -> Value {
     })
 }
 
-/// 字段缺省或为 null 视为未提供；提供了就必须合法
-fn opt<'a, T>(
-    v: &'a Value,
-    key: &str,
-    parse: impl FnOnce(&'a Value) -> Option<T>,
-    msg: &str,
-) -> Result<Option<T>, ApiError> {
-    match v.get(key).filter(|x| !x.is_null()) {
-        None => Ok(None),
-        Some(x) => parse(x).map(Some).ok_or_else(|| bad_request(msg)),
-    }
-}
-
 fn config_set(shared: &Shared, v: &Value) -> ApiResult {
-    let mode = opt(
-        v,
-        "mode",
-        |x| x.as_u64().and_then(|n| Mode::try_from(n).ok()),
-        "无效的工作模式",
-    )?;
-    let interval = opt(
-        v,
-        "interval",
-        |x| x.as_u64().filter(|n| INTERVAL_RANGE.contains(n)),
-        "间隔需在 1-3600 秒之间",
-    )?;
-    let cpuset_name = opt(
+    let bad = |msg: &'static str| move || bad_request(msg);
+    let mode = opt_field(v, "mode", parse_mode, bad("无效的工作模式"))?;
+    let interval = opt_field(v, "interval", parse_interval, bad("间隔需在 1-3600 秒之间"))?;
+    let cpuset_name = opt_field(
         v,
         "cpuset_name",
-        |x| {
-            x.as_str()
-                .filter(|n| valid_cpuset_name(n))
-                .map(str::to_string)
-        },
-        "无效的 cpuset 目录名",
+        parse_cpuset_name,
+        bad("无效的 cpuset 目录名"),
     )?;
-    let config_file = opt(
+    let config_file = opt_field(
         v,
         "config_file",
         |x| x.as_str().filter(|p| config_path_ok(p)).map(str::to_string),
-        "无效的配置文件路径，文件名需以 .conf 结尾",
+        bad("无效的配置文件路径，文件名需以 .conf 结尾"),
     )?;
 
     shared
@@ -719,7 +693,10 @@ mod tests {
         assert_eq!(s.settings(), before);
         assert!(config_set(&s, &json!({"mode": 2, "interval": 7})).is_ok());
         let after = s.settings();
-        assert_eq!((after.mode, after.check_interval), (Mode::Proc, 7));
+        assert_eq!(
+            (after.mode, after.check_interval),
+            (crate::settings::Mode::Proc, 7)
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 }

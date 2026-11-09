@@ -71,53 +71,49 @@ pub fn valid_path(s: &str) -> bool {
     !s.is_empty() && s.len() < 256 && !s.bytes().any(|b| b < 0x20 || b == 0x7f)
 }
 
+/// 字段缺省或为 null 视为未提供；提供了就必须被 parse 接受，否则返回 bad()
+pub fn opt_field<'a, T, E>(
+    v: &'a Value,
+    key: &str,
+    parse: impl FnOnce(&'a Value) -> Option<T>,
+    bad: impl FnOnce() -> E,
+) -> Result<Option<T>, E> {
+    match v.get(key).filter(|x| !x.is_null()) {
+        None => Ok(None),
+        Some(x) => parse(x).map(Some).ok_or_else(bad),
+    }
+}
+
+pub fn parse_mode(x: &Value) -> Option<Mode> {
+    x.as_u64().and_then(|n| Mode::try_from(n).ok())
+}
+
+pub fn parse_interval(x: &Value) -> Option<u64> {
+    x.as_u64().filter(|n| INTERVAL_RANGE.contains(n))
+}
+
+pub fn parse_cpuset_name(x: &Value) -> Option<String> {
+    x.as_str()
+        .filter(|s| valid_cpuset_name(s))
+        .map(str::to_string)
+}
+
 impl Settings {
     /// 缺省字段取默认值，出现但取值非法的字段报错
     pub fn from_json(v: &Value) -> Result<Self, String> {
         let d = Settings::default();
-        let field = |key: &str| v.get(key).filter(|x| !x.is_null());
-        let bad = |key: &str| format!("字段 {key} 的取值无效");
-
-        let web_enable = match field("web_enable") {
-            None => d.web_enable,
-            Some(x) => x.as_bool().ok_or_else(|| bad("web_enable"))?,
-        };
-        let mode = match field("mode") {
-            None => d.mode,
-            Some(x) => x
-                .as_u64()
-                .and_then(|n| Mode::try_from(n).ok())
-                .ok_or_else(|| bad("mode"))?,
-        };
-        let check_interval = match field("check_interval") {
-            None => d.check_interval,
-            Some(x) => x
-                .as_u64()
-                .filter(|n| INTERVAL_RANGE.contains(n))
-                .ok_or_else(|| bad("check_interval"))?,
-        };
-        let cpuset_name = match field("cpuset_name") {
-            None => d.cpuset_name,
-            Some(x) => x
-                .as_str()
-                .filter(|s| valid_cpuset_name(s))
-                .ok_or_else(|| bad("cpuset_name"))?
-                .to_string(),
-        };
-        let config_file = match field("config_file") {
-            None => d.config_file,
-            Some(x) => x
-                .as_str()
-                .filter(|s| valid_path(s))
-                .ok_or_else(|| bad("config_file"))?
-                .to_string(),
-        };
+        let bad = |key: &'static str| move || format!("字段 {key} 的取值无效");
+        let path = |x: &Value| x.as_str().filter(|s| valid_path(s)).map(str::to_string);
         Ok(Self {
-            web_enable,
-            mode,
-            check_interval,
-            cpuset_name,
-            config_file,
+            web_enable: opt_field(v, "web_enable", Value::as_bool, bad("web_enable"))?
+                .unwrap_or(d.web_enable),
+            mode: opt_field(v, "mode", parse_mode, bad("mode"))?.unwrap_or(d.mode),
+            check_interval: opt_field(v, "check_interval", parse_interval, bad("check_interval"))?
+                .unwrap_or(d.check_interval),
+            cpuset_name: opt_field(v, "cpuset_name", parse_cpuset_name, bad("cpuset_name"))?
+                .unwrap_or(d.cpuset_name),
+            config_file: opt_field(v, "config_file", path, bad("config_file"))?
+                .unwrap_or(d.config_file),
         })
     }
 
