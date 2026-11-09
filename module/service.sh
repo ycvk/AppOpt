@@ -9,7 +9,7 @@ wait_sys_boot_completed
 MODDIR=${0%/*}
 cd $MODDIR
 
-nohup ${MODDIR}/AppOpt -w >/dev/null 2>&1 &
+nohup ${MODDIR}/AppOpt >/dev/null 2>&1 &
 
 for MAX_CPUS in /sys/devices/system/cpu/cpu*/core_ctl/max_cpus; do
 	if [ -e "$MAX_CPUS" ] && [ "$(cat $MAX_CPUS)" != "$(cat ${MAX_CPUS%/*}/min_cpus)" ]; then

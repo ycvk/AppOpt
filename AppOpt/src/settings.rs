@@ -212,6 +212,19 @@ mod tests {
     }
 
     #[test]
+    fn shipped_module_settings_enable_web() {
+        let v: Value = serde_json::from_str(include_str!("../../module/AppOpt.json")).unwrap();
+        let s = Settings::from_json(&v).unwrap();
+        assert_eq!(
+            s,
+            Settings {
+                web_enable: true,
+                ..Settings::default()
+            }
+        );
+    }
+
+    #[test]
     fn roundtrip_and_load_rules() {
         let dir = std::env::temp_dir().join(format!("appopt-settings-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);

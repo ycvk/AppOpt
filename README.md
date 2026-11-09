@@ -112,12 +112,13 @@ AppOpt [-c <配置文件>] [-s <秒>] [-b <名称>] [-w]
 |------|------|
 | `module.prop` | 模块信息 |
 | `customize.sh` | 安装脚本：检查环境，按设备架构（arm64、x86_64）放置二进制，沿用旧版本的 `applist.conf` 与 `AppOpt.json`，并打印本机的核心分层与规则示例 |
-| `service.sh` | 开机后启动 `AppOpt -w`，并把各 cluster 的 `core_ctl` 最小核心数调到与最大值一致 |
+| `service.sh` | 开机后启动 `AppOpt`，并把各 cluster 的 `core_ctl` 最小核心数调到与最大值一致 |
 | `applist.conf` | 默认规则 |
+| `AppOpt.json` | 默认设置，开启网页面板 |
 | `webroot/index.html` | 跳转到网页面板 |
 | `META-INF/` | Magisk 安装入口 |
 
-安装后规则文件在 `/data/adb/modules/AppOpt/applist.conf`。
+安装后规则文件在 `/data/adb/modules/AppOpt/applist.conf`。网页面板是否启动由同目录 `AppOpt.json` 的 `web_enable` 决定，改为 `false` 后重启生效。
 
 模块 zip 由 `module/` 的全部内容加上各架构的两个产物组成，产物放在 `bin/<架构>/` 下：
 
