@@ -662,27 +662,9 @@ mod tests {
         assert!(pkg_shape_ok("a{T"));
     }
 
-    fn shared_fixture(name: &str) -> (Shared, std::path::PathBuf) {
-        use crate::cpuset::{CpuSet, CpuTopology};
-        use crate::settings::Settings;
-        let dir = std::env::temp_dir().join(format!("appopt-web-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let conf = dir.join("applist.conf");
-        fs::write(&conf, "a=0\n").unwrap();
-        let settings = Settings {
-            config_file: conf.to_string_lossy().into_owned(),
-            ..Settings::default()
-        };
-        let set = |s| CpuSet::parse_list(s).unwrap();
-        let topo = CpuTopology::from_groups(set("0-7"), [(1, set("0-3")), (2, set("4-7"))]);
-        let shared = Shared::new(settings, dir.join("AppOpt.json"), topo, None).unwrap();
-        (shared, dir)
-    }
-
     #[test]
     fn config_set_validates_each_field() {
-        let (s, dir) = shared_fixture("cfgset");
+        let (s, dir) = crate::shared::tests::fixture("web-cfgset", "a=0\n");
         let before = s.settings();
         for (body, msg) in [
             (json!({"mode": 3}), "无效的工作模式"),
@@ -723,7 +705,7 @@ mod tests {
 
     #[test]
     fn optional_fields_must_have_the_right_type() {
-        let (s, dir) = shared_fixture("optfields");
+        let (s, dir) = crate::shared::tests::fixture("web-optfields", "a=0\n");
         let conf = dir.join("applist.conf");
         let expect_400 = |r: ApiResult, msg: &str| match r {
             Err(ApiError(status, m)) => assert_eq!((status, m.as_str()), (400, msg)),

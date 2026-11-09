@@ -286,12 +286,12 @@ impl Shared {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::cpuset::CpuSet;
     use crate::rule_edit;
 
-    fn fixture(name: &str, rules: &str) -> (Shared, PathBuf) {
+    pub(crate) fn fixture(name: &str, rules: &str) -> (Shared, PathBuf) {
         let dir = std::env::temp_dir().join(format!("appopt-shared-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
