@@ -188,12 +188,7 @@ fn normalize_singles(lines: &mut Vec<String>, pkg: &str) {
             lines.insert(close + off, line);
         }
     } else if let Some(PkgLine::Standalone(i)) = t2.pkg_line {
-        lines[i] = format!("{} {{", lines[i].trim_end());
-        let chunk: Vec<String> = items
-            .into_iter()
-            .chain(std::iter::once("}".to_string()))
-            .collect();
-        lines.splice(i + 1..i + 1, chunk);
+        expand_block(lines, i, items);
     } else {
         let chunk: Vec<String> = std::iter::once(bare_open_line(pkg))
             .chain(items)
@@ -202,6 +197,12 @@ fn normalize_singles(lines: &mut Vec<String>, pkg: &str) {
         let at = at.min(lines.len());
         lines.splice(at..at, chunk);
     }
+}
+
+/// 把独立的包级行 i 扩成块，块内放入 items
+fn expand_block(lines: &mut Vec<String>, i: usize, items: impl IntoIterator<Item = String>) {
+    lines[i] = format!("{} {{", lines[i].trim_end());
+    lines.splice(i + 1..i + 1, items.into_iter().chain(["}".to_string()]));
 }
 
 fn bare_open_line(pkg: &str) -> String {
@@ -290,11 +291,7 @@ pub fn upsert(
     } else if let Some(close) = t.block_close {
         lines.insert(close, format!("\t{thread}={cpus}"));
     } else if let Some(PkgLine::Standalone(i)) = t.pkg_line {
-        lines[i] = format!("{} {{", lines[i].trim_end());
-        lines.splice(
-            i + 1..i + 1,
-            [format!("\t{thread}={cpus}"), "}".to_string()],
-        );
+        expand_block(lines, i, [format!("\t{thread}={cpus}")]);
     } else if t.unterminated {
         return Err(EditError::Malformed);
     } else {
